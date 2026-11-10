@@ -1,7 +1,8 @@
 """Exercise real scripted parsing, routing and Npad serialization with authored files/API spies.
 
 The parser, LIVE reader, input routing and Npad writer are extracted unmodified from production. Clock,
-foreground-window, keyboard, mouse and pad APIs are fakes; no real device, desktop or game is accessed.
+foreground-window, keyboard, mouse and pad APIs are fakes; no real device, desktop or game is accessed. The item buttons'
+filter (host/oot_item_buttons.c) is a pass-through spy: it is the last change to a read's buttons, once per read.
 Each case starts a fresh process because production caches environment settings. Frame-clock cases retain holds
 through a seven-second wall pause, test native-frame boundaries/live offsets/slot reuse, and keep default/0/empty controls.
 
@@ -62,6 +63,10 @@ def main():
         raise SystemExit("the host cannot see the menu's row (option 4)")
     if '"Controller in background", &opts.pad_background' not in menu:
         raise SystemExit("the Insert menu has no row for it")
+    npad = block(hid, "static void npad_states(")
+    step, filtered, written = (npad.find(s) for s in ("hos_frame_step_buttons(buttons)", "hos_oot_ib_filter(buttons)", "++sampling"))
+    if not 0 <= step < filtered < written:
+        raise SystemExit("the item buttons' filter is not the last change to the buttons before they are written")
 
     api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")
     constants = block(hid, "enum { B_A") + ";\n" + block(api, "enum { HOS_SW_A") + ";\n"

@@ -1020,7 +1020,10 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     const int native = native_env ? atoi(native_env) != 0 : rx_option(6, 0);
     int hos_mouse_native(void);
     void hos_mouse_native_free(int free);
-    const uint64_t game_stick = (1ULL << B_ZR) | (1ULL << B_L) | (1ULL << B_R);
+    int hos_oot_ib_hotkey(void);   /* (oot_item_buttons.c: the shoulder held as the item buttons' hotkey opens no quick-switch
+                                      menu, so the mouse goes on turning the camera; -1 with them off) */
+    const int ib_key = hos_oot_ib_hotkey();
+    const uint64_t game_stick = ((1ULL << B_ZR) | (1ULL << B_L) | (1ULL << B_R)) & ~(ib_key >= 0 ? 1ULL << ib_key : 0);
     int captured = 0, as_stick = !native;
     if (native) {
         mouse_setup();
@@ -1030,7 +1033,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         if (captured < 0) captured = 0, as_stick = 1;
     }
     if (as_stick) {
-        captured = mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1));
+        captured = mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1) && ib_key != B_L);
         if (captured) stick_max(stick, mouse);
     }
     mouse_buttons_arm(captured);
@@ -1110,6 +1113,8 @@ static void npad_states(Ctx *c) {
     if (connected) buttons = hos_title_input(buttons);
     uint64_t hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the frame step of the wheel and quick menus */
     if (connected) buttons = hos_frame_step_buttons(buttons);
+    uint64_t hos_oot_ib_filter(uint64_t buttons);   /* oot_item_buttons.c: the item buttons' hotkey, A B X Y under it, ZR */
+    if (connected) buttons = hos_oot_ib_filter(buttons);
     int64_t s = ++sampling;
     for (int i = 0; i < count; i++) {
         uint64_t e = out + (uint64_t)i * STATE_SIZE;
