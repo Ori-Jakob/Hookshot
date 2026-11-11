@@ -744,7 +744,7 @@ static int live_textures(const char *dir, int face, const int *bind) {
 
 static Live lay;                       /* over the game's Common.blarc */
 static struct {
-    volatile uint64_t at;              /* where the game keeps the served font, decrypted (behind its header), 0 not seen */
+    volatile uint64_t at;              /* where the game keeps the served font, decrypted (hos_prompts_glyph), 0 not seen */
     uint32_t n;                        /* the file's length */
     uint8_t head[64];                  /* its first bytes, decrypted: the tables' directory */
 } font;
@@ -948,10 +948,15 @@ void hos_prompts_glyph(uint64_t slot) {
         last = face;   /* (another font: not looked at again while its glyphs follow each other) */
         return;
     }
-    const uint64_t at = base[0] + (base[1] == font.n ? 8 : 0);   /* (kept with its 8-byte header, or without) */
-    const uint8_t *q = (const uint8_t *)hos_guest_range(at, font.n - 8);
-    if (!q) return;
-    if (memcmp(q, font.head, sizeof font.head)) {
+    /* (decrypted at the stream's start, its size the file's as the game gives every font's, or the font's alone; or
+       behind its 8-byte header, its size the file's) */
+    uint64_t at = 0;
+    for (int k = 0; k < 2 && !at && (!k || base[1] == font.n); k++) {
+        const uint8_t *q = (const uint8_t *)hos_guest_range(base[0] + 8u * (unsigned)k, font.n - 8);
+        if (!q) return;   /* (not readable yet: looked at again) */
+        if (!memcmp(q, font.head, sizeof font.head)) at = base[0] + 8u * (unsigned)k;
+    }
+    if (!at) {
         last = face;   /* (another font of that size) */
         return;
     }
