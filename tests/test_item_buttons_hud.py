@@ -268,11 +268,12 @@ def game_side(hud, core):
     check(words and [w.strip() for w in words.group(1).split(",")] == ['"      Assign"', '" +"', '"Assign"'],
           "the guides' words are not the quick-switch menu's spaced Assign, the plus, the pause menu's Assign")
     # the pause menu's tab glyphs: ZL and ZR (makeGuideKeyIconMsg 6 and 8) while its tabs are up with the feature on, L and R
-    # (5 and 7) otherwise, on T_BtnL_00 and T_BtnR_00, set only when the pane's text differs
+    # (5 and 7) otherwise, on T_BtnL_00 and T_BtnR_00, set only when the pane's text differs (by the buttons its codes show:
+    # tests/test_item_buttons_live_prompts.py)
     tabs = function(core, "ib_tab_glyphs")
     check("{IB_KEY_L, IB_KEY_R, IB_KEY_ZL, IB_KEY_ZR}" in tabs and "const int want = zl ? 2 + i : i" in tabs and
           re.search(r"IB_KEY_ZL = 6\b", core) and re.search(r"IB_KEY_ZR = 8\b", core) and
-          "ib_put_key(c, pane, keys[want]);" in tabs and "!memcmp(GP(text), ib_tabs.key[want], (size_t)len)" in tabs and
+          "ib_put_key(c, pane, keys[want]);" in tabs and "ib_same_glyph((const uint8_t *)GP(text), len, ib_tabs.key[want], ib_tabs.len[want])" in tabs and
           '"T_BtnL_00", "T_BtnR_00"' in core and "ib_tab_glyphs(c, ov, on && tabs == 1);" in overlay,
           "the tab bar's glyphs are not ZL and ZR on the pause menu's tabs alone, the game's L and R otherwise")
     # the pause menu's screen and the overlay are handled after their updates; the filter's stamp is the pause menu's

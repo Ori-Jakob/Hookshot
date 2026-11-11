@@ -1531,6 +1531,31 @@ static int ib_key_text(Ctx *c, int key, char out[8]) {
     return n;
 }
 
+unsigned hos_prompts_game_code(unsigned code);   /* prompts.c */
+
+static unsigned ib_code3(const uint8_t *p) {   /* a code of three bytes in UTF-8 (1110xxxx 10xxxxxx 10xxxxxx), else 0 */
+    return (p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80
+               ? (unsigned)(p[0] & 0x0F) << 12 | (unsigned)(p[1] & 0x3F) << 6 | (p[2] & 0x3F) : 0;
+}
+
+/* 1 when a pane's text (n bytes at s) is a key's glyph as makeGuideKeyIconMsg gives it (k bytes): the same bytes, but for the
+   button codes the prompts rewrote in the pane after a change of face or controls while the game runs (host/prompts.c
+   text_rewrite: a code of its own for each face and pad input, three bytes as the game's) */
+static int ib_same_glyph(const uint8_t *s, int n, const char *key, int k) {
+    const uint8_t *q = (const uint8_t *)key;
+    if (n != k) return 0;
+    for (int i = 0; i < n; i++) {
+        const unsigned a = i + 2 < n ? ib_code3(s + i) : 0, b = i + 2 < n ? ib_code3(q + i) : 0;
+        if (a && b) {
+            if (hos_prompts_game_code(a) != hos_prompts_game_code(b)) return 0;
+            i += 2;
+        } else if (s[i] != q[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* What an entry gets (no guest memory read: tests/test_item_buttons_filter.py checks it alone): the combo (1), ZR's
    glyph back (-1) or nothing (0). want: a combo is shown; open: its part's state (1 opening, 2 open); mine: it has a
    text of ours, wanted: that one; zr: its text is ZR's glyph alone */
@@ -1594,7 +1619,7 @@ static void ib_ctrl_guide_locked(Ctx *c, uint64_t screen) {
         const int len = (int32_t)ib_peek(tp + 0x124, 4), open = (int)ib_peek(layout + 0x3a, 1);   /* (1 opening, 2 open) */
         int mine = ib_cg.mem && text >= ib_cg.mem && text < ib_cg.mem + IB_COMBOS * IB_COMBO_ROOM;
         const int zr = len == ib_cg.zr_len && text >= 0x100000 && hos_guest_range(text, (unsigned)len) &&
-                       !memcmp(GP(text), ib_cg.zr, (size_t)len);
+                       ib_same_glyph((const uint8_t *)GP(text), len, ib_cg.zr, ib_cg.zr_len);
         const int todo = ib_entry(want != 0, open, mine, text == want + 0x18, zr);
         if (todo > 0) {
             const uint64_t x[2] = {pane, want};
@@ -1838,7 +1863,7 @@ static void ib_tab_glyphs(Ctx *c, uint64_t ov, int zl) {
         const int want = zl ? 2 + i : i, len = (int32_t)ib_peek(tp + 0x124, 4);
         const uint64_t text = ib_peek(tp + 0xf0, 8);   /* (the pane's text and its length in bytes) */
         if (len == ib_tabs.len[want] && text >= 0x100000 && hos_guest_range(text, (unsigned)len) &&
-            !memcmp(GP(text), ib_tabs.key[want], (size_t)len))
+            ib_same_glyph((const uint8_t *)GP(text), len, ib_tabs.key[want], ib_tabs.len[want]))
             continue;
         ib_put_key(c, pane, keys[want]);
     }

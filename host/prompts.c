@@ -1034,6 +1034,17 @@ static int text_code(unsigned c, int face, const int *bind) {   /* the code that
     return BIND_BASE + (face * HOS_SW_N + b) * HOS_PAD_ART_N + pad;
 }
 
+/* the game's own code of what a text's code shows (a Switch button's or a d-pad icon's), the game's or one text_code gave it;
+   any other code as it is. host/oot_item_buttons.c compares a pane's text with the game's message of a key by it */
+unsigned hos_prompts_game_code(unsigned c) {
+    if (c >= BIND_BASE && c < BIND_BASE + HOS_PROMPT_N * HOS_SW_N * HOS_PAD_ART_N)
+        return switch_code[(c - BIND_BASE) / HOS_PAD_ART_N % HOS_SW_N];   /* (text_code's: the inputs with artwork) */
+    if (c >= PAD_BASE + STATIC_AT && c < PAD_BASE + FACE_CODES * HOS_PROMPT_N && (c - PAD_BASE) % FACE_CODES >= STATIC_AT &&
+        (c - PAD_BASE) % FACE_CODES < STATIC_AT + 3)
+        return static_code[(c - PAD_BASE) % FACE_CODES - STATIC_AT];
+    return c;
+}
+
 /* the box's codes for the buttons as they are now; 1 when it changed them */
 static int text_rewrite(uint64_t box) {
     if (!font_changes) return 0;
