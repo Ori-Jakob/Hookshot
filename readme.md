@@ -624,7 +624,9 @@ written when the game saves, into the slot it saves to, so choosing items change
 quitting without saving loses the change, as it does a change of the ZR item. When a save loads, an item it does not
 hold for that age (or one the file names wrongly) comes off its button, and a new game starts with none. The game never
 reads the file: your saves stay usable on a console and in other programs, and `scripts/oot_saves.py` carries it with
-its slot ([using a save from an emulator](docs/saves.md)).
+its slot ([using a save from an emulator](docs/saves.md)). The HUD's boxes, the Assign guides and the Items page's icons
+are layouts the game loads only when the option is on as it starts: turned on while you play, the buttons work at once
+and those come with the next start; left off, the game loads its own layouts.
 
 To change which gamepad button or key presses a Switch button, or which keys move and turn the camera, open the
 Controls tab's Controls page. Choose a row and a column (Gamepad or Keyboard), press <kbd>Enter</kbd> (or the bottom
