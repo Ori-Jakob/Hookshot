@@ -1335,8 +1335,8 @@ Row rows[] = {
      "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", nullptr, false, true},
     // (hookshot) Item assignable buttons: the hotkey's row is fixed while they are Off (row_fixed)
     {TAB_CONTROLS, "Item assignable buttons", &opts.item_buttons, 0, 1, 1, tx_onoff,
-     "Puts an item on each of A, B, X and Y, used while the hotkey, a shoulder button, is held. The items are kept beside "
-     "your saves, not in them.", hn_item_buttons, false, true},
+     "Puts an item on each of A, B, X and Y, used while the hotkey, a shoulder button, is held. Each save keeps its own "
+     "items, written when the game saves.", hn_item_buttons, false, true},
     {TAB_CONTROLS, "Item button hotkey", &opts.item_hotkey, 0, 1, 1, tx_item_hotkey,
      "Which shoulder button is held to use the items on A, B, X and Y: the Switch's L or R, on whatever your controls put "
      "it.", hn_item_hotkey, false, true},

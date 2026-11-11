@@ -618,9 +618,13 @@ the HUD shows them beside the ZR item with the hotkey's button icon over them, l
 item used this way is out (a drawn bow, a carried bomb), ZR uses it too, as if ZR had drawn it, and the hints at the
 bottom of the screen show it beside ZR ("Fire ZR, L + A"; with the game's own button icons, without the comma and the
 plus); once it is put away ZR is the ZR item again. The hotkey is the Switch's L or R, so it follows the gamepad button
-or key your controls put it on. The items are kept in `item_buttons.ini` beside the `save` folder (in `user` in the game
-folder on Windows, `~/.local/share/hookshot` on Linux), never in the game's save: your saves stay as the game writes
-them, usable on a console and in other programs.
+or key your controls put it on. Each save keeps its own items, in an `item_buttons.ini` in that save's folder
+(`save/<user id>/slot_NN/`, under `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux). The file is
+written when the game saves, into the slot it saves to, so choosing items changes them for the game you are playing and
+quitting without saving loses the change, as it does a change of the ZR item. When a save loads, an item it does not
+hold for that age (or one the file names wrongly) comes off its button, and a new game starts with none. The game never
+reads the file: your saves stay usable on a console and in other programs, and `scripts/oot_saves.py` carries it with
+its slot ([using a save from an emulator](docs/saves.md)).
 
 To change which gamepad button or key presses a Switch button, or which keys move and turn the camera, open the
 Controls tab's Controls page. Choose a row and a column (Gamepad or Keyboard), press <kbd>Enter</kbd> (or the bottom
@@ -770,7 +774,7 @@ use them.
 |---|---|
 | `image.bin` | The game image to run. Without it the game uses the `image.bin`, `romfs` and `user` in its folder |
 | `--romfs <folder>` | The extracted RomFS folder |
-| `--user <folder>` | Where the game keeps per-user data: saves, the item buttons' `item_buttons.ini`, caches and temp files (and `mouse_sens.txt` when `HOS_MOUSE_SENS` is set; the menu keeps the sensitivity otherwise). Default: `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux; with an explicit image path, `user` in the current folder |
+| `--user <folder>` | Where the game keeps per-user data: saves (each save slot's folder with that save's `item_buttons.ini` for the item buttons), caches and temp files (and `mouse_sens.txt` when `HOS_MOUSE_SENS` is set; the menu keeps the sensitivity otherwise). Default: `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux; with an explicit image path, `user` in the current folder |
 | `--trace` | Log every Horizon OS call (the same as `HOS_TRACE=1`) |
 | `--prepare-shaders` | Prepare the shaders as the first start does, then exit without starting the game (no build step runs it) |
 
