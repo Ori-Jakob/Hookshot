@@ -23,6 +23,12 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
   calls of f_80522050, its GPU memory (GPU_ALLOC_SITES), and its two tryAllocs of CPU buffers (HEAP_ALLOC_SITES). They went on
   with a null pointer and crashed writing through it (issue 1697). The supported build only.
 - Ocarina note controls: the note-wait action's start (f_828a9190) and tick (f_828a9280) report the wait to the host (hos_oc_wait, hos_oc_beat), which swaps the five notes for its own controls (host/nn_hid.c); a tick whose gates refuse reports no wait, so a dialogue keeps its buttons.
+- Item assignable buttons (the Insert menu's Controls tab; host/oot_item_buttons.c, oot_item_buttons_hud.c for the HUD): a call
+  into the host in ten functions, in the supported build's lift only (IB_HOOKS). The Main state's selector and its
+  transitions tell the host when the player is in play; Link's input step and the ZR slot's getter and setter let a face button
+  use its item as ZR uses the slot's (the getter answers the player's readers, every other caller sees the saved slot); the
+  quick-switch menu's decide, its screen's update and its entries' binding take an assignment and show it (the same update hook
+  shows the hotkey beside ZR in the control guide); the HUD's init and the screens' destructor bind and drop the four boxes.
 """
 import collections
 import glob
@@ -339,6 +345,72 @@ def patch_zstd_stream(source):
         return source
     at = start + len(ZSTD_HEAD)
     return (source[:at] + ZSTD_CALL + source[at:]).replace('#include "a64.h"\n', '#include "a64.h"\nint hos_zstd_stream(Ctx *c);\n', 1)
+
+
+# Item assignable buttons (host/oot_item_buttons.c, host/oot_item_buttons_hud.c): (what, the function's head, None for first in
+# the function or the spellings of the line it follows there, the call, its declaration).
+IB_HOOKS = (
+    # (the Main state's selector: x0)
+    ("main state", "void f_83323ca0(Ctx *__restrict A64_NOESC c) {\n", None,
+     "hos_oot_ib_main(c, c->x[0]);", "extern void hos_oot_ib_main(Ctx *c, uint64_t selector);\n"),
+    # (requestTransition where the transition is made, reached from the link test or, past the event checks, by a backward goto:
+    # x19 the selector, w1 the link. A bare label (nx2/poll.py puts the poll before that goto), or the poll after it in C lifted
+    # before that)
+    ("main state's transition", "void f_80f89630(Ctx *__restrict A64_NOESC c) {\n",
+     ("L_80f89660:;\n", "L_80f89660:; A64_POLL(c);\n"),
+     "hos_oot_ib_leave(c, c->x[19], c->x[1]);", "extern void hos_oot_ib_leave(Ctx *c, uint64_t selector, uint64_t link);\n"),
+    # (PlayerComponent::calcVirtualKeys: x0 the component)
+    ("player's input", "void f_80594ab0(Ctx *__restrict A64_NOESC c) {\n", None,
+     "hos_oot_ib_player(c, c->x[0]);", "extern void hos_oot_ib_player(Ctx *c, uint64_t component);\n"),
+    # (PouchMgr::getAssignableItem: x0 the manager, w1 the age, w2 isDirect, x30 the caller. Before the stack frame is made, where
+    # the function's own early return (no PlayerStatus) leaves with -1: the host's answer in w0 and a return are the whole call)
+    ("slot getter", "void f_8019b6e0(Ctx *__restrict A64_NOESC c) {\n", None,
+     "if (hos_oot_ib_slot(c)) return;", "extern int hos_oot_ib_slot(Ctx *c);\n"),
+    # (PouchMgr::setAssignableItem: w1 the age, w2 the item, w3 the reason)
+    ("slot setter", "void f_81231c00(Ctx *__restrict A64_NOESC c) {\n", None,
+     "hos_oot_ib_slot_set(c);", "extern void hos_oot_ib_slot_set(Ctx *c);\n"),
+    # (ShortCutSlideList::decide: x0 the row, w1 isBCancel)
+    ("quick-switch decide", "void f_833e98f0(Ctx *__restrict A64_NOESC c) {\n", None,
+     "hos_oot_ib_decide(c);", "extern void hos_oot_ib_decide(Ctx *c);\n"),
+    # (Screen::calc after the screen's update, its vtable's +0x300, on the default path the HUD and the quick-switch screens take:
+    # x19 the screen. A second call in the function: the menus' hook stays first)
+    ("screen update", MENU_TICK_HEAD, ("{ uint64_t _t = c->x[8]; c->x[30] = 0x802f1538ULL; A64_ICALL(c, _t); }\n",),
+     "hos_oot_ib_screen(c, c->x[19]);", "extern void hos_oot_ib_screen(Ctx *c, uint64_t screen);\n"),
+    # (ShortCutSlideListControl::onBindItem after setInvalid, before the label its early exits share: only an entry that was
+    # bound. x19 the ItemBtn, w20 the entry's item, w21 the ZR item)
+    ("quick-switch binding", "void f_833ea110(Ctx *__restrict A64_NOESC c) {\n", ("c->x[30] = 0x833ea514ULL; f_80f40400(c);\n",),
+     "hos_oot_ib_bind(c, c->x[19], c->x[20]);", "extern void hos_oot_ib_bind(Ctx *c, uint64_t btn, uint64_t item);\n"),
+    # (UIPlayerStatusScreen::initLayout: x0 the screen, x1 its heap)
+    ("HUD init", "void f_83415d20(Ctx *__restrict A64_NOESC c) {\n", None,
+     "hos_oot_ib_hud_init(c, c->x[0], c->x[1]);", "extern void hos_oot_ib_hud_init(Ctx *c, uint64_t screen, uint64_t heap);\n"),
+    # (ScreenBase::~ScreenBase, every screen's: x0 the screen)
+    ("screen destructor", "void f_80aa2ad0(Ctx *__restrict A64_NOESC c) {\n", None,
+     "hos_oot_ib_screen_gone(c->x[0]);", "extern void hos_oot_ib_screen_gone(uint64_t screen);\n"),
+)
+
+
+def patch_item_button(source, hook):
+    """One of IB_HOOKS: its call first in its function or after its line there (found once), and its declaration. None when
+    the file has no such function or the line is not there once; source as it is when the call is in the function already"""
+    _, head, anchors, call, decl = hook
+    start = source.find(head)
+    if start < 0:
+        return None
+    end = source.find("\n}", start)
+    body = source[start:end if end >= 0 else len(source)]
+    if call in body:   # (made before: a lift patched again)
+        return source
+    if anchors is None:
+        at = start + len(head)
+    else:
+        for anchor in anchors:
+            if body.count(anchor) == 1:
+                break
+        else:
+            return None
+        at = start + body.index(anchor) + len(anchor)
+    source = source[:at] + "    " + call + "   /* (nx2/oot_patches.py: item buttons) */\n" + source[at:]
+    return source if decl in source else source.replace('#include "a64.h"\n', '#include "a64.h"\n' + decl, 1)
 
 
 TEXT_HEAD = "void f_80b1e140(Ctx *__restrict A64_NOESC c) {"
@@ -838,6 +910,12 @@ def patch_file(s, name, protect_hearts=False):
         out = layout
         counts["text layout hook"] += 1
         lines.append("oot_patches: the text boxes' layout hook in " + name)
+    for hook in IB_HOOKS if protect_hearts else ():
+        item = patch_item_button(out, hook)
+        if item is not None:
+            out = item
+            counts["item buttons' %s hook" % hook[0]] += 1
+            lines.append("oot_patches: the item buttons' %s hook in %s" % (hook[0], name))
     movie = patch_movie_frames(out)
     if movie is not None:
         if MOVIE_NEW in movie:   # (made now, or by an earlier run over this file)
@@ -957,6 +1035,8 @@ def report(paths, counts, protect_hearts=False):
         done["disable camera centering"] = 0
         done["scene format"] = 0
         done["zstd stream hook"] = 0
+        for hook in IB_HOOKS:
+            done["item buttons' %s hook" % hook[0]] = 0
     total = collections.Counter()
     for c in counts:
         total.update(c)
