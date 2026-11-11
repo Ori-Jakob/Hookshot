@@ -630,8 +630,11 @@ static void ib_save_slot(int slot, const char *path) {
         hos_log("item buttons: slot_%02d saved: no items, %s", slot, r ? "its item_buttons.ini removed" : "no item_buttons.ini");
 }
 
+static void ib_new_game_seen(void);
+
 /* nn_fs.c's OpenFile, each file the game has opened (guest: its path; write: for writing). A slot's progress.sav read is
-   a load of that slot, written a save into it. With the feature off too: a save then carries what was loaded */
+   a load of that slot, written a save into it. With the feature off too: a save then carries what was loaded. A save
+   before a new game's first tick of play (the autosave New Game starts with) takes none of the last save's items */
 void hos_oot_ib_save_file(const char *guest, int write) {
     const int slot = ib_slot_of(guest);
     if (slot < 0 || !__atomic_load_n(&ib_hooked, __ATOMIC_ACQUIRE) || !ib_names_ready()) return;
@@ -640,7 +643,7 @@ void hos_oot_ib_save_file(const char *guest, int write) {
         hos_log("item buttons: slot_%02d has no folder on the host: its items are not kept", slot);
         return;
     }
-    if (write) ib_save_slot(slot, path);
+    if (write) ib_new_game_seen(), ib_save_slot(slot, path);
     else ib_load_slot(slot, path);
 }
 
@@ -784,13 +787,19 @@ static void ib_new_game_now(void) {
     hos_log("item buttons: a new game (no save loaded since the title): no items on A, B, X and Y");
 }
 
+/* The title has come up since play last ran and nothing was loaded since: a new game, its items emptied. Asked at each
+   tick of play and before each save (whichever comes first after the title takes it) */
+static void ib_new_game_seen(void) {
+    const int title = __atomic_load_n(&ib_title_open, __ATOMIC_ACQUIRE) && __atomic_exchange_n(&ib_title_open, 0, __ATOMIC_ACQ_REL);
+    if (ib_new_game(title, __atomic_load_n(&ib_title_ns, __ATOMIC_ACQUIRE), __atomic_load_n(&ib_load_ns, __ATOMIC_ACQUIRE)))
+        ib_new_game_now();
+}
+
 /* Each tick of play. A new game is seen with the feature off too (its first save must not take the last save's items);
    with it on, the filter's context is stamped and the items checked */
 void hos_oot_ib_main(Ctx *c, uint64_t selector) {
     (void)selector;
-    const int title = __atomic_load_n(&ib_title_open, __ATOMIC_ACQUIRE) && __atomic_exchange_n(&ib_title_open, 0, __ATOMIC_ACQ_REL);
-    if (ib_new_game(title, __atomic_load_n(&ib_title_ns, __ATOMIC_ACQUIRE), __atomic_load_n(&ib_load_ns, __ATOMIC_ACQUIRE)))
-        ib_new_game_now();
+    ib_new_game_seen();
     if (!ib_enabled()) return;
     __atomic_store_n(&ib_main_ns, hos_now_ns(), __ATOMIC_RELEASE);
     ib_check(c);

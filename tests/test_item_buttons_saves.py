@@ -161,7 +161,7 @@ def game_side(core):
     check(re.search(r"^void hos_oot_ib_save_file\(const char \*guest, int write\) \{", core, re.M),
           "hos_oot_ib_save_file is not what nn_fs.c declares")
     check("const int slot = ib_slot_of(guest);" in observer and "__atomic_load_n(&ib_hooked," in observer and
-          "if (write) ib_save_slot(slot, path);" in observer and "else ib_load_slot(slot, path);" in observer,
+          "ib_save_slot(slot, path);" in observer and "else ib_load_slot(slot, path);" in observer,
           "a slot's progress.sav opened is not a load (read) or a save (written) of that slot, once the hooks have run")
     check("ib_enabled" not in observer, "a save does not carry the items with the feature off")
     path = function(core, "ib_slot_path")
@@ -215,8 +215,13 @@ def game_side(core):
           checked.index("AcquireSRWLockExclusive") > checked.index("ib_valid_items"),
           "the check calls into the game or logs with the lock held")
     main = function(core, "hos_oot_ib_main")
-    new, off, check_at = main.find("if (ib_new_game("), main.find("if (!ib_enabled()) return;"), main.find("ib_check(c);")
+    new, off, check_at = main.find("ib_new_game_seen();"), main.find("if (!ib_enabled()) return;"), main.find("ib_check(c);")
     check(0 <= new < off < check_at, "a new game is not seen with the feature off, or the check runs with it off")
+    seen = function(core, "ib_new_game_seen")
+    check("__atomic_exchange_n(&ib_title_open, 0," in seen and "if (ib_new_game(title," in seen and "ib_new_game_now();" in seen,
+          "the title's coming up is not taken once, by play or a save, to tell a new game")
+    check("if (write) ib_new_game_seen(), ib_save_slot(slot, path);" in observer,
+          "a save before a new game's first tick of play (New Game's autosave) would take the last save's items")
     fresh = function(core, "ib_new_game_now")
     check("ib_items[age][k] = IB_NONE" in fresh and "__atomic_store_n(&ib_checked[age], gen," in fresh,
           "a new game does not start with no items, both ages checked")
