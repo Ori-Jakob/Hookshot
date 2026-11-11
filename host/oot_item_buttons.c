@@ -634,7 +634,9 @@ static void ib_new_game_seen(void);
 
 /* nn_fs.c's OpenFile, each file the game has opened (guest: its path; write: for writing). A slot's progress.sav read is
    a load of that slot, written a save into it. With the feature off too: a save then carries what was loaded. A save
-   before a new game's first tick of play (the autosave New Game starts with) takes none of the last save's items */
+   before a new game's first tick of play (the autosave New Game starts with) takes none of the last save's items.
+   The file is written at the open, the one place the slot is known, not when the save is done: a save that fails after
+   its open leaves the file newer than the save. Harmless, as a load checks the items against the save it loaded */
 void hos_oot_ib_save_file(const char *guest, int write) {
     const int slot = ib_slot_of(guest);
     if (slot < 0 || !__atomic_load_n(&ib_hooked, __ATOMIC_ACQUIRE) || !ib_names_ready()) return;
