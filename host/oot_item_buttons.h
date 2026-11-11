@@ -1,11 +1,12 @@
 /* (hookshot) Item assignable buttons (the Insert menu's Controls tab): what the feature's two files share.
-   host/oot_item_buttons.c has the controller filter, the item slot's answers, the game's hooks and the file the
+   host/oot_item_buttons.c has the controller filter, the item slot's answers, the game's hooks and the files the
    assignments are kept in; host/oot_item_buttons_hud.c shows the four items on the game's HUD.
 
    The game has one item slot, used with ZR, and a quick-switch menu on L and R. With the feature on, one of the two
    shoulder buttons is a hotkey the game no longer sees: held in play, A B X Y each use the item assigned to them; with the
    quick-switch menu open (the other shoulder button), or on the pause menu's Items page, hotkey + A B X Y assigns the item
-   shown. Nothing is written to the game's save: the items are in <user>/item_buttons.ini.
+   shown. Each save keeps its own items, in an item_buttons.ini in its slot's folder (save:/slot_NN/) that the game never
+   reads: written when the game saves into that slot, read and checked against the save when it loads it.
 
    The hooks are nx2/oot_patches.py's (the supported build's lift only). Without them none of this runs and the filter
    passes every button through. */
@@ -23,9 +24,10 @@ int ib_enabled(void);                       /* the menu's Item assignable button
 enum { IB_HOTKEY_L, IB_HOTKEY_R };
 int ib_hotkey(void);                        /* the menu's Item button hotkey */
 int ib_age(Ctx *c);                         /* the age the game plays now, IB_ADULT or IB_CHILD */
-int ib_assignment(int age, int button);     /* the item on a face button, or IB_NONE */
+int ib_assignment(int age, int button);     /* the item on a face button, or IB_NONE (also while that age's items are not
+                                               checked against the save loaded yet) */
 int ib_large(void);                         /* the hotkey is held where it works: the HUD's large arrangement */
-unsigned ib_generation(void);               /* changes whenever an assignment does */
+unsigned ib_generation(void);               /* changes whenever the items do (an assignment, a load, its check) */
 
 /* a call of a game function on the game's thread: x[0..nx) and s[0..ns) in, x0 out; the Ctx is put back as it was */
 uint64_t ib_guest(Ctx *c, uint64_t fn, int nx, const uint64_t *x, int ns, const float *s);

@@ -8,28 +8,34 @@
    answering it for the slot to the player's own readers for a while and presenting ZR to the game in the face
    button's stead, so the press, the hold and the release are the game's own (a bow draws while the button is held and
    shoots when it is let go). Everything else that reads the slot (the HUD's ZR box, the menus, the pouch's
-   bookkeeping) keeps seeing the saved one. Nothing is written to the game's save: the items are in
-   <user>/item_buttons.ini.
+   bookkeeping) keeps seeing the saved one. The items are kept with each save, in an item_buttons.ini in its slot's
+   folder that the game never reads: read when the game loads that slot, checked against the save once play starts,
+   written when the game saves into a slot. An assignment changes them in memory only.
 
-   The calls into here are nx2/oot_patches.py's (the supported build only) and one in nn_hid.c:
+   The calls into here are nx2/oot_patches.py's (the supported build only) and one each in nn_hid.c and nn_fs.c:
    - hos_oot_ib_filter: each controller read (npad_states, the polling thread). The hotkey and the face buttons pressed
      under it are hidden from the game where the hotkey works, ZR is presented for a face button, and the presses
      become requests for the hooks below.
+   - hos_oot_ib_save_file (nn_fs.c): each file the game opens. A slot's progress.sav read is a load of that slot,
+     written a save into it (gmd::SaveDataMgr's thread).
    - hos_oot_ib_main, hos_oot_ib_leave: the Main sequence state's selector (f_83323ca0) and its commit to leave it
-     (f_80f89630): play, where the hotkey works.
+     (f_80f89630): play, where the hotkey works. There a save's items are checked once it has loaded, and a new game's
+     emptied.
    - hos_oot_ib_player: Link's virtual keys (f_80594ab0), once a frame before his item selector: a use is started,
      followed and ended there, and whether its item is out (drawn, in hand: ZR is then that item's) is told.
    - hos_oot_ib_slot, hos_oot_ib_slot_set: PouchMgr::getAssignableItem (f_8019b6e0) and setAssignableItem (f_81231c00).
    - hos_oot_ib_screen: after every screen's update (Screen::calc, f_802f1380): the quick-switch menu here (assignments,
      the entries' glyphs and light blue, its key guide), the pause menu and the screen over it (assignments on the Items
-     page, its slots' light blue and glyphs, the tab bar's glyphs, the key guide) and the control guide (the hotkey's
-     combo beside ZR while its item is out), the HUD in oot_item_buttons_hud.c.
+     page, its slots' light blue and glyphs, the tab bar's glyphs, the key guide), the control guide (the hotkey's
+     combo beside ZR while its item is out) and the title screen (a new game is play with no load since it came up),
+     the HUD in oot_item_buttons_hud.c.
    - hos_oot_ib_decide, hos_oot_ib_bind: the quick-switch's decide (f_833e98f0) and the binding of its entries
      (f_833ea110).
-   Without them nothing here runs and the filter passes every button through.
+   Without them nothing here runs, the filter passes every button through and no save's file is read or written.
 
-   The hooks run on several of the game's threads (the sequence's, Link's worker, the UI's workers, the poll's): what
-   they share is atomic, and none waits for another (a busy try-lock skips that frame). */
+   The hooks run on several of the game's threads (the sequence's, Link's worker, the UI's workers, the poll's, the
+   saves'): what they share is atomic, or for the items under one lock held only to copy or change them (never over a
+   file or a call into the game), and none waits for another otherwise (a busy try-lock skips that frame). */
 #include "hos.h"
 #include "oot_item_buttons.h"
 #include <ctype.h>
@@ -41,7 +47,6 @@
 
 int rx_option(int id, int otherwise);
 int hos_oot_is_player(Ctx *c, uint64_t actor);   /* hos_main.c */
-extern const char *hos_user_dir;
 
 /* the game's (lifted addresses) */
 #define IB_UI_SLOT 0x84e9cfa8ULL          /* game::ui::UIModule */
@@ -57,9 +62,11 @@ extern const char *hos_user_dir;
 #define IB_LINK_VTABLE 0x84b45e18ULL
 #define IB_SHORTCUT_VTABLE 0x84c0d430ULL  /* UIShortCutScreen */
 #define IB_HUD_VTABLE 0x84c0b710ULL       /* UIPlayerStatusScreen */
+#define IB_TITLE_VTABLE 0x84c106e8ULL     /* UITitleScreen */
 
 #define IB_LIVE_NS 100000000LL      /* (a hook ran this recently: its context holds) */
 #define IB_REQUEST_NS 200000000LL   /* (a request older than this is not acted on) */
+#define IB_LOAD_TWICE_NS 1000000000LL   /* (a load opens its progress.sav again this soon) */
 #define IB_READY_FRAMES 90          /* (a use gives up when the selector has not taken its item by then) */
 #define IB_LEAVE_FRAMES 30          /* (a real ZR press waits at most this long for the selector to leave the item) */
 #define IB_REAL_FRAMES 300          /* (and then at most this long for its release to be seen) */
@@ -187,8 +194,7 @@ static uint64_t ib_step(IbFilter *f, const IbPoll *p) {
 }
 
 /* ---- what the hooks and the filter share (atomics) */
-static int ib_items[IB_AGES][IB_BUTTONS] = {{IB_NONE, IB_NONE, IB_NONE, IB_NONE}, {IB_NONE, IB_NONE, IB_NONE, IB_NONE}};
-static unsigned ib_gen;
+static unsigned ib_gen;               /* the items' generation: any change of what ib_assignment answers bumps it */
 static int64_t ib_main_ns;            /* the Main state's selector ran (0: it has left Main since) */
 static int64_t ib_menu_ns;            /* the quick-switch screen ran open */
 static int ib_usable;                 /* its list takes an assignment */
@@ -366,8 +372,9 @@ void ib_pin_slot(Ctx *c, int item) {
     ib_pin_ctx = item == IB_NONE ? NULL : c;
 }
 
-/* ---- the file: <user>/item_buttons.ini, a line a button with an item, "<age>_<button>=<the game's name>". The
-   names are handed in (the game's own table at run time), so tests/test_item_buttons_ini.py checks this alone */
+/* ---- the file: each save's own, save:/slot_NN/item_buttons.ini beside its progress.sav, a line a button with an item,
+   "<age>_<button>=<the game's name>", and no file when no button has one. The names are handed in (the game's own table
+   at run time), so tests/test_item_buttons_ini.py checks this alone */
 static const char *const ib_age_keys[IB_AGES] = {"adult", "child"};
 static const char ib_button_keys[IB_BUTTONS + 1] = "abxy";
 
@@ -433,10 +440,18 @@ static int ib_ini_read(const char *path, const char *const names[IB_ITEMS], int 
     return n;
 }
 
+/* the items with a name, the ones the file keeps */
+static int ib_named(const char *const names[IB_ITEMS], int items[IB_AGES][IB_BUTTONS]) {
+    int n = 0;
+    for (int age = 0; age < IB_AGES; age++)
+        for (int k = 0; k < IB_BUTTONS; k++) n += items[age][k] >= 0 && items[age][k] < IB_ITEMS && names[items[age][k]];
+    return n;
+}
+
 /* the file's text for these items, its length (-1: it does not fit) */
 static int ib_ini_text(char *out, size_t cap, const char *const names[IB_ITEMS], int items[IB_AGES][IB_BUTTONS]) {
     int n = snprintf(out, cap, "# Hookshot's Item assignable buttons (the Insert menu, Controls): the item on A, B, X and Y "
-                               "for each age. Not part of the game's save.\n");
+                               "for each age, kept with this save. The game does not read this file.\n");
     for (int age = IB_AGES - 1; age >= 0 && n >= 0 && (size_t)n < cap; age--)   /* (the child's first: the game starts as one) */
         for (int k = 0; k < IB_BUTTONS && n >= 0 && (size_t)n < cap; k++) {
             const int item = items[age][k];
@@ -448,10 +463,14 @@ static int ib_ini_text(char *out, size_t cap, const char *const names[IB_ITEMS],
     return n >= 0 && (size_t)n < cap ? n : -1;
 }
 
-/* The items to the file: written to <path>.tmp, which then takes the file's place, unless the file holds them already.
-   1 written, 0 nothing to write, -1 not written */
+/* The items to the file: written to <path>.tmp, which then takes the file's place, unless the file holds them already;
+   with no item (none with a name) the file is removed instead. 1 written or removed, 0 nothing to do, -1 not done */
 static int ib_ini_write(const char *path, const char *const names[IB_ITEMS], int items[IB_AGES][IB_BUTTONS]) {
     char text[2048], old[sizeof text + 1], tmp[600];
+    if (!ib_named(names, items)) {
+        if (!remove(path)) return 1;
+        return errno == ENOENT ? 0 : -1;
+    }
     const int n = ib_ini_text(text, sizeof text, names, items);
     if (n < 0 || snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
     FILE *f = fopen(path, "rb");
@@ -472,7 +491,7 @@ static int ib_ini_write(const char *path, const char *const names[IB_ITEMS], int
 }
 
 /* The game's AssignableItem names, from its own table (so no list of them is kept here): host copies, NULL for an
-   item without one. 0 when the table is not what it should be (nothing is then kept in the file) */
+   item without one. 0 when the table is not what it should be (nothing is then kept in the files) */
 static const char *ib_names[IB_ITEMS];
 static char ib_name_text[IB_ITEMS][32];
 static int ib_names_from_game(void) {
@@ -495,65 +514,144 @@ static int ib_names_from_game(void) {
     return found;
 }
 
-static const char *ib_name(int item) { return item >= 0 && item < IB_ITEMS && ib_names[item] ? ib_names[item] : "an item"; }
-
-static void ib_path(char *out, size_t cap) {
-    snprintf(out, cap, "%s/item_buttons.ini", hos_user_dir ? hos_user_dir : "user");
+/* The names, read the first time they are wanted (they need the game's image): 1 when they are there */
+static int ib_names_ready(void) {
+    static SRWLOCK once = SRWLOCK_INIT;
+    static int state;   /* (0 not read yet, 1 found, -1 not found) */
+    int s = __atomic_load_n(&state, __ATOMIC_ACQUIRE), read = 0;
+    if (!s) {
+        AcquireSRWLockExclusive(&once);
+        if (!(s = __atomic_load_n(&state, __ATOMIC_ACQUIRE)))
+            s = ib_names_from_game() ? 1 : -1, read = 1, __atomic_store_n(&state, s, __ATOMIC_RELEASE);
+        ReleaseSRWLockExclusive(&once);
+    }
+    if (read && s < 0) hos_log("item buttons: the game's item names were not found: the items on A, B, X and Y are not kept");
+    return s > 0;
 }
 
-enum { IB_FILE_UNREAD, IB_FILE_READING, IB_FILE_READ, IB_FILE_NONE };
-static int ib_file = IB_FILE_UNREAD;
+static const char *ib_name(int item) {
+    return item >= 0 && item < IB_ITEMS && ib_names_ready() && ib_names[item] ? ib_names[item] : "an item";
+}
 
-/* The file, read once, from the first hook that asks for an item (the names need the game's image) */
-static void ib_load(void) {
-    int unread = IB_FILE_UNREAD;
-    if (__atomic_load_n(&ib_file, __ATOMIC_ACQUIRE) != IB_FILE_UNREAD ||
-        !__atomic_compare_exchange_n(&ib_file, &unread, IB_FILE_READING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        return;
-    if (!ib_names_from_game()) {
-        hos_log("item buttons: the game's item names were not found: the items on A, B, X and Y are not kept");
-        __atomic_store_n(&ib_file, IB_FILE_NONE, __ATOMIC_RELEASE);
-        return;
-    }
-    char path[600];
-    ib_path(path, sizeof path);
+/* ---- the saves. The game reads a slot's progress.sav to load it and writes it to save into it, on its thread
+   gmd::SaveDataMgr (nn_fs.c tells each open: hos_oot_ib_save_file). A load reads that slot's file into the items, a save
+   writes them to the slot it goes to, which is often not the one loaded (an autosave takes the oldest autosave's slot, a
+   save from the menu the one slot kept for those, whichever was loaded). An assignment changes the items in memory
+   only, so a game left without saving loses it, as it loses a change of the ZR item. A load's items are checked against
+   the save once play runs (hook 1), each age while the game is at it (a slot's actor, and so the test, follows the
+   age): until then ib_assignment answers none for that age, and a save writes them as they were read. A new game (play
+   with no load since the title came up) starts with none. These three read no guest memory:
+   tests/test_item_buttons_saves.py checks them alone */
+
+/* the slot of a guest path that is exactly save:/slot_NN/progress.sav, -1 for any other */
+static int ib_slot_of(const char *guest) {
+    static const char head[] = "save:/slot_", tail[] = "/progress.sav";
+    if (strncmp(guest, head, sizeof head - 1)) return -1;
+    const char *d = guest + sizeof head - 1;
+    if (d[0] < '0' || d[0] > '9' || d[1] < '0' || d[1] > '9' || strcmp(d + 2, tail)) return -1;
+    return (d[0] - '0') * 10 + (d[1] - '0');
+}
+
+/* An age's items kept where valid (bits by item) has them, the others emptied: the buttons emptied, as bits */
+static unsigned ib_keep_valid(int items[IB_BUTTONS], uint64_t valid) {
+    unsigned emptied = 0;
+    for (int k = 0; k < IB_BUTTONS; k++)
+        if (items[k] != IB_NONE && (items[k] < 0 || items[k] >= IB_ITEMS || !(valid >> items[k] & 1)))
+            items[k] = IB_NONE, emptied |= 1u << k;
+    return emptied;
+}
+
+/* Play runs (hook 1): a new game when the title has come up since it last ran (title) and nothing was loaded since
+   (load_ns before title_ns; 0 for no load yet) */
+static int ib_new_game(int title, int64_t title_ns, int64_t load_ns) { return title && load_ns < title_ns; }
+
+static SRWLOCK ib_lock = SRWLOCK_INIT;   /* the items, the load generation and the ages checked change under it */
+static int ib_items[IB_AGES][IB_BUTTONS] = {{IB_NONE, IB_NONE, IB_NONE, IB_NONE}, {IB_NONE, IB_NONE, IB_NONE, IB_NONE}};
+static unsigned ib_load_gen;             /* each load and each new game: its items */
+static unsigned ib_checked[IB_AGES];     /* the load generation each age's items were checked for */
+static int64_t ib_load_ns;               /* the last load */
+static int ib_title_open;                /* the title screen has come up since play last ran */
+static int64_t ib_title_ns, ib_title_last_ns;   /* when it came up; its last frame */
+static int ib_hooked;                    /* hook 7 has run: the build has the hooks */
+
+/* slot NN's file on the host, through the save mount (with /: fopen on Linux takes no \), 0 when there is none */
+static int ib_slot_path(int slot, char *out, size_t cap) {
+    char guest[48];
+    snprintf(guest, sizeof guest, "save:/slot_%02d/item_buttons.ini", slot);
+    if (!hos_fs_host_path(guest, out, cap)) return 0;
+    for (char *p = out; *p; p++)
+        if (*p == '\\') *p = '/';
+    return 1;
+}
+
+/* A load of slot NN: its file's items, none where it has none (each load opens progress.sav twice: said once) */
+static void ib_load_slot(int slot, const char *path) {
+    static int said_slot = -1;   /* (the saves' thread alone) */
+    static int64_t said_ns;
     int items[IB_AGES][IB_BUTTONS];
     const int away = hos_vcore_away();
     const int n = ib_ini_read(path, ib_names, items);
     const int missing = n < 0 && errno == ENOENT;
     if (away) hos_vcore_back();
-    if (n >= 0) {
-        for (int age = 0; age < IB_AGES; age++)
-            for (int k = 0; k < IB_BUTTONS; k++) __atomic_store_n(&ib_items[age][k], items[age][k], __ATOMIC_RELEASE);
-        __atomic_add_fetch(&ib_gen, 1, __ATOMIC_RELEASE);
-        hos_log("item buttons: %s: %d item%s on A, B, X and Y", path, n, n == 1 ? "" : "s");
-    } else if (missing) {
-        hos_log("item buttons: no %s yet", path);
-    } else {
-        hos_log("item buttons: %s could not be read: no items on A, B, X and Y", path);
-    }
-    __atomic_store_n(&ib_file, IB_FILE_READ, __ATOMIC_RELEASE);
+    const int64_t now = hos_now_ns();
+    __atomic_store_n(&ib_load_ns, now, __ATOMIC_RELEASE);
+    AcquireSRWLockExclusive(&ib_lock);
+    memcpy(ib_items, items, sizeof ib_items);
+    __atomic_add_fetch(&ib_load_gen, 1, __ATOMIC_ACQ_REL);
+    ReleaseSRWLockExclusive(&ib_lock);
+    __atomic_add_fetch(&ib_gen, 1, __ATOMIC_RELEASE);
+    if (slot == said_slot && now - said_ns < IB_LOAD_TWICE_NS) return;
+    said_slot = slot, said_ns = now;
+    if (n >= 0)
+        hos_log("item buttons: slot_%02d loaded: %d item%s on A, B, X and Y, checked once play runs", slot, n, n == 1 ? "" : "s");
+    else if (missing)
+        hos_log("item buttons: slot_%02d loaded: no item_buttons.ini, no items", slot);
+    else
+        hos_log("item buttons: slot_%02d loaded: %s could not be read, no items", slot, path);
 }
 
-/* (the menu's hook, after an assignment) */
-static void ib_save(void) {
-    if (__atomic_load_n(&ib_file, __ATOMIC_ACQUIRE) != IB_FILE_READ) return;
+/* A save into slot NN: the items to its file as they are (an age not checked yet keeps what was read), the file removed
+   when there are none */
+static void ib_save_slot(int slot, const char *path) {
     int items[IB_AGES][IB_BUTTONS];
-    for (int age = 0; age < IB_AGES; age++)
-        for (int k = 0; k < IB_BUTTONS; k++) items[age][k] = __atomic_load_n(&ib_items[age][k], __ATOMIC_ACQUIRE);
-    char path[600];
-    ib_path(path, sizeof path);
+    AcquireSRWLockShared(&ib_lock);
+    memcpy(items, ib_items, sizeof items);
+    ReleaseSRWLockShared(&ib_lock);
+    const int n = ib_named(ib_names, items);
     const int away = hos_vcore_away();
     const int r = ib_ini_write(path, ib_names, items);
     if (away) hos_vcore_back();
-    static int said;
-    if (r < 0 && !said) said = 1, hos_log("item buttons: %s could not be written: the items last until the game is closed", path);
+    if (r < 0)
+        hos_log("item buttons: slot_%02d saved, but %s could not be %s", slot, path, n ? "written" : "removed");
+    else if (n)
+        hos_log("item buttons: slot_%02d saved: %d item%s on A, B, X and Y%s", slot, n, n == 1 ? "" : "s",
+                r ? "" : " (the file had them already)");
+    else
+        hos_log("item buttons: slot_%02d saved: no items, %s", slot, r ? "its item_buttons.ini removed" : "no item_buttons.ini");
 }
 
+/* nn_fs.c's OpenFile, each file the game has opened (guest: its path; write: for writing). A slot's progress.sav read is
+   a load of that slot, written a save into it. With the feature off too: a save then carries what was loaded */
+void hos_oot_ib_save_file(const char *guest, int write) {
+    const int slot = ib_slot_of(guest);
+    if (slot < 0 || !__atomic_load_n(&ib_hooked, __ATOMIC_ACQUIRE) || !ib_names_ready()) return;
+    char path[600];
+    if (!ib_slot_path(slot, path, sizeof path)) {
+        hos_log("item buttons: slot_%02d has no folder on the host: its items are not kept", slot);
+        return;
+    }
+    if (write) ib_save_slot(slot, path);
+    else ib_load_slot(slot, path);
+}
+
+/* (an age's items are answered once they are checked against the save loaded) */
 int ib_assignment(int age, int button) {
     if (age < 0 || age >= IB_AGES || button < 0 || button >= IB_BUTTONS) return IB_NONE;
-    ib_load();
-    return __atomic_load_n(&ib_items[age][button], __ATOMIC_ACQUIRE);
+    AcquireSRWLockShared(&ib_lock);
+    const int checked = __atomic_load_n(&ib_checked[age], __ATOMIC_RELAXED) == __atomic_load_n(&ib_load_gen, __ATOMIC_RELAXED);
+    const int item = checked ? ib_items[age][button] : IB_NONE;
+    ReleaseSRWLockShared(&ib_lock);
+    return item;
 }
 
 unsigned ib_generation(void) { return __atomic_load_n(&ib_gen, __ATOMIC_ACQUIRE); }
@@ -585,9 +683,117 @@ static void ib_drop(void) {
 }
 
 /* ---- hooks 1 and 2: play */
+
+/* the game's (lifted): the pouch's calls the quick-switch makes its list with (buildShortCutList) */
+#define IB_POUCH_ARRAY 0x80a8f690ULL     /* PouchMgr::getPouchArray(mgr, w1 kind): 0 the ItemArray */
+#define IB_ARRAY_COUNT 0x80021a20ULL     /* an array's count, its parents' entries with it */
+#define IB_SLOT_ACTOR 0x80a8ef20ULL      /* PouchMgr::getCurrentActorOfSlot(mgr, w1 kind, w2 slot, x3 s32 *bottle, x4 u32 *entry) */
+#define IB_ACTOR_SHORT 0x8002a4c0ULL     /* PouchItemParam::getActorShort(param): a char ** */
+#define IB_ITEM_OF_ACTOR 0x833c6860ULL   /* PouchMgr::getAssignableItemOfActor(mgr, x1 char **): -1 none */
+#define IB_LISTABLE 0x805b6af0ULL        /* PouchMgr::canListInShortCut(mgr, x1 char **, w2 bottle, x3 param, w4 age) */
+#define IB_IS_GET 0x801a1160ULL          /* PouchMgr::isGet(x0 char **): its IsGet flag */
+
+/* The items the quick-switch would list now for the age the game is at (bits by item): each of the pouch's ItemArray
+   slots by the actor it shows, which the age picks, through the game's own test (owned and usable at that age: a bomb
+   bag with no bombs left is, a bottle by the bottle alone, the ocarina, the masks and the boots never, having no such
+   slot). A bottle slot's item is its own enum (the bottle rows all say BottleA). With the Items page's one difference:
+   a child's Magic Beans on their IsGet alone (the quick-switch wants one left, or an unnamed counter of the game's at 1
+   to 9). Reads only, no lock. 0 when the walk cannot be made now (no pouch or no UI yet, a count that is no array's) */
+static int ib_valid_items(Ctx *c, int age, uint64_t *valid) {
+    static const uint64_t calls[] = {IB_POUCH_ARRAY, IB_ARRAY_COUNT, IB_SLOT_ACTOR, IB_ACTOR_SHORT, IB_ITEM_OF_ACTOR,
+                                     IB_LISTABLE, IB_IS_GET};
+    for (size_t i = 0; i < sizeof calls / sizeof *calls; i++)
+        if (!a64_lookup(calls[i])) return 0;
+    const uint64_t mgr = ib_peek(IB_POUCH_SLOT, 8), scr = ib_scratch(c);
+    if (!mgr || !ib_peek(IB_UI_SLOT, 8)) return 0;
+    const uint64_t kind[2] = {mgr, 0};
+    const uint64_t array = ib_guest(c, IB_POUCH_ARRAY, 2, kind, 0, NULL);
+    const int n = array ? (int32_t)ib_guest(c, IB_ARRAY_COUNT, 1, &array, 0, NULL) : 0;
+    if (n < 1 || n > 64) return 0;
+    const int bean = ib_item_named(ib_names, "MagicBean");
+    uint64_t v = 0;
+    for (int i = 0; i < n; i++) {
+        recomp_store32_sp(c, scr, 0xffffffffu), recomp_store32_sp(c, scr + 4, 0);   /* (the bottle's enum: -1, the game's start) */
+        const uint64_t at[5] = {mgr, 0, (uint32_t)i, scr, scr + 4};
+        const uint64_t actor = ib_guest(c, IB_SLOT_ACTOR, 5, at, 0, NULL);
+        const uint64_t name = actor ? ib_guest(c, IB_ACTOR_SHORT, 1, &actor, 0, NULL) : 0;
+        if (!name || !ib_peek(ib_peek(name, 8), 1)) continue;   /* (an empty slot) */
+        const int bottle = (int32_t)ib_peek(scr, 4);
+        const uint64_t of[2] = {mgr, name};
+        const int item = ib_bottle(bottle) ? bottle : (int32_t)ib_guest(c, IB_ITEM_OF_ACTOR, 2, of, 0, NULL);
+        if (item < 0 || item >= IB_ITEMS) continue;
+        const uint64_t list[5] = {mgr, name, (uint32_t)bottle, actor, (uint64_t)age};
+        if ((ib_guest(c, IB_LISTABLE, 5, list, 0, NULL) & 1) ||
+            (item == bean && age == IB_CHILD && (ib_guest(c, IB_IS_GET, 1, &name, 0, NULL) & 1)))
+            v |= 1ULL << item;
+    }
+    *valid = v;
+    return 1;
+}
+
+/* "Bow on A, Bomb on X" for the buttons in bits, "none" for none */
+static const char *ib_list(char *out, size_t cap, const int items[IB_BUTTONS], unsigned bits) {
+    size_t n = 0;
+    out[0] = 0;
+    for (int k = 0; k < IB_BUTTONS && n < cap; k++)
+        if (bits >> k & 1) {
+            const int m = snprintf(out + n, cap - n, "%s%s on %c", n ? ", " : "", ib_name(items[k]), "ABXY"[k]);
+            n = m < 0 ? cap : n + (size_t)m;
+        }
+    return n ? out : "none";
+}
+
+/* The items of the age the game is at, once after each load: those the save does not hold for that age, or that the
+   file names wrongly, emptied. Not while the title is up. A walk that cannot be made is tried again next tick (nothing
+   emptied); one a load came during is dropped (that load's check comes next) */
+static void ib_check(Ctx *c) {
+    const int age = ib_age(c);
+    const unsigned gen = __atomic_load_n(&ib_load_gen, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&ib_checked[age], __ATOMIC_ACQUIRE) == gen || !ib_names_ready() ||
+        hos_now_ns() - __atomic_load_n(&ib_title_last_ns, __ATOMIC_ACQUIRE) < IB_LIVE_NS)
+        return;
+    uint64_t valid;
+    if (!ib_valid_items(c, age, &valid)) return;
+    int was[IB_BUTTONS], done = 0;
+    unsigned emptied = 0, kept = 0;
+    AcquireSRWLockExclusive(&ib_lock);
+    if (__atomic_load_n(&ib_load_gen, __ATOMIC_ACQUIRE) == gen) {
+        memcpy(was, ib_items[age], sizeof was);
+        emptied = ib_keep_valid(ib_items[age], valid);
+        __atomic_store_n(&ib_checked[age], gen, __ATOMIC_RELEASE);
+        done = 1;
+    }
+    ReleaseSRWLockExclusive(&ib_lock);
+    if (!done) return;
+    __atomic_add_fetch(&ib_gen, 1, __ATOMIC_RELEASE);
+    for (int k = 0; k < IB_BUTTONS; k++) kept |= (unsigned)(was[k] != IB_NONE && !(emptied >> k & 1)) << k;
+    char kept_text[200], emptied_text[200];
+    hos_log("item buttons: the %s's items checked against the save: kept %s; emptied %s", ib_age_keys[age],
+            ib_list(kept_text, sizeof kept_text, was, kept), ib_list(emptied_text, sizeof emptied_text, was, emptied));
+}
+
+/* a new game: no items, both ages as checked */
+static void ib_new_game_now(void) {
+    AcquireSRWLockExclusive(&ib_lock);
+    for (int age = 0; age < IB_AGES; age++)
+        for (int k = 0; k < IB_BUTTONS; k++) ib_items[age][k] = IB_NONE;
+    const unsigned gen = __atomic_add_fetch(&ib_load_gen, 1, __ATOMIC_ACQ_REL);
+    for (int age = 0; age < IB_AGES; age++) __atomic_store_n(&ib_checked[age], gen, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&ib_lock);
+    __atomic_add_fetch(&ib_gen, 1, __ATOMIC_RELEASE);
+    hos_log("item buttons: a new game (no save loaded since the title): no items on A, B, X and Y");
+}
+
+/* Each tick of play. A new game is seen with the feature off too (its first save must not take the last save's items);
+   with it on, the filter's context is stamped and the items checked */
 void hos_oot_ib_main(Ctx *c, uint64_t selector) {
-    (void)c, (void)selector;
-    if (ib_enabled()) __atomic_store_n(&ib_main_ns, hos_now_ns(), __ATOMIC_RELEASE);
+    (void)selector;
+    const int title = __atomic_load_n(&ib_title_open, __ATOMIC_ACQUIRE) && __atomic_exchange_n(&ib_title_open, 0, __ATOMIC_ACQ_REL);
+    if (ib_new_game(title, __atomic_load_n(&ib_title_ns, __ATOMIC_ACQUIRE), __atomic_load_n(&ib_load_ns, __ATOMIC_ACQUIRE)))
+        ib_new_game_now();
+    if (!ib_enabled()) return;
+    __atomic_store_n(&ib_main_ns, hos_now_ns(), __ATOMIC_RELEASE);
+    ib_check(c);
 }
 
 /* The selector leaves Main (link: the state it goes to). For the quick-switch the item answered for ZR goes now,
@@ -905,22 +1111,22 @@ static uint64_t ib_guest_mem(void) {
 static uint64_t ib_pane_name(uint64_t m, int i) { return m + (uint64_t)(IB_PANE_NAMES + IB_NAME_ROOM * i); }
 
 /* An item on face button k of an age, or off it when it is there already (the menus' assignments): an item sits on one
-   face button of an age at a time. Logged, the file written. 0 when nothing was done (no item; the file being read) */
+   face button of an age at a time. In memory only, logged: the game's next save writes it. 0 when nothing was done (no
+   item; that age's items not checked against the save yet) */
 static int ib_put(int age, int k, int item) {
-    ib_load();
-    if (item < 0 || item >= IB_ITEMS || __atomic_load_n(&ib_file, __ATOMIC_ACQUIRE) == IB_FILE_READING) return 0;
-    if (__atomic_load_n(&ib_items[age][k], __ATOMIC_ACQUIRE) == item) {
-        __atomic_store_n(&ib_items[age][k], IB_NONE, __ATOMIC_RELEASE);
-        hos_log("item buttons: %s off %c (%s)", ib_name(item), "ABXY"[k], ib_age_keys[age]);
-    } else {
+    if (item < 0 || item >= IB_ITEMS) return 0;
+    int done = 0, off = 0;
+    AcquireSRWLockExclusive(&ib_lock);
+    if (__atomic_load_n(&ib_checked[age], __ATOMIC_ACQUIRE) == __atomic_load_n(&ib_load_gen, __ATOMIC_ACQUIRE)) {
+        done = 1, off = ib_items[age][k] == item;
         for (int j = 0; j < IB_BUTTONS; j++)
-            if (j != k && __atomic_load_n(&ib_items[age][j], __ATOMIC_ACQUIRE) == item)
-                __atomic_store_n(&ib_items[age][j], IB_NONE, __ATOMIC_RELEASE);
-        __atomic_store_n(&ib_items[age][k], item, __ATOMIC_RELEASE);
-        hos_log("item buttons: %s on %c (%s)", ib_name(item), "ABXY"[k], ib_age_keys[age]);
+            if (ib_items[age][j] == item) ib_items[age][j] = IB_NONE;
+        if (!off) ib_items[age][k] = item;
     }
+    ReleaseSRWLockExclusive(&ib_lock);
+    if (!done) return 0;
     __atomic_add_fetch(&ib_gen, 1, __ATOMIC_RELEASE);
-    ib_save();
+    hos_log("item buttons: %s %s %c (%s)", ib_name(item), off ? "off" : "on", "ABXY"[k], ib_age_keys[age]);
     return 1;
 }
 
@@ -1679,12 +1885,25 @@ void ib_screen_gone(uint64_t screen) {
         __atomic_store_n(&ib_pause_ns, 0, __ATOMIC_RELEASE);
 }
 
+/* hook 7 with the title screen (UITitleScreen): the title has come up, when it had not since play last ran and its
+   frames had stopped (a frame of it as play starts is no new title) */
+static void ib_title(void) {
+    const int64_t now = hos_now_ns(), last = __atomic_exchange_n(&ib_title_last_ns, now, __ATOMIC_ACQ_REL);
+    if (now - last > IB_LIVE_NS && !__atomic_load_n(&ib_title_open, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&ib_title_ns, now, __ATOMIC_RELEASE);
+        __atomic_store_n(&ib_title_open, 1, __ATOMIC_RELEASE);
+        hos_log("item buttons: the title screen came up");
+    }
+}
+
 /* hook 7: after a screen's update, every screen's every frame (x19 the screen) */
 void hos_oot_ib_screen(Ctx *c, uint64_t screen) {
     const uint64_t vt = ib_peek(screen, 8);
+    if (!__atomic_load_n(&ib_hooked, __ATOMIC_RELAXED)) __atomic_store_n(&ib_hooked, 1, __ATOMIC_RELEASE);
     if (vt == IB_SHORTCUT_VTABLE) ib_shortcut(c, screen);
     else if (vt == IB_HUD_VTABLE) ib_hud_tick(c, screen);
     else if (vt == IB_CTRL_GUIDE_VTABLE) ib_ctrl_guide(c, screen);
     else if (vt == IB_PLUS_VTABLE) ib_pause(c, screen);
     else if (vt == IB_OVERLAY_VTABLE) ib_overlay(c, screen);
+    else if (vt == IB_TITLE_VTABLE) ib_title();
 }

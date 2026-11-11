@@ -1,4 +1,5 @@
-"""The item buttons' file, <user>/item_buttons.ini (host/oot_item_buttons.c: ib_ini_read, ib_ini_write).
+"""The item buttons' file, each save's save:/slot_NN/item_buttons.ini (host/oot_item_buttons.c: ib_ini_read,
+ib_ini_write).
 
 Its code is compiled alone with a made-up table of item names handed in (in the game the names come from the game's own
 table at run time, so none are kept in the repository), and run on a folder of its own. Pinned here: the items written
@@ -7,7 +8,9 @@ an item without a name is left out; a file that is not there reads as none; line
 button, a name that is no item, an item already on another button of that age, a second line for one button, the tail of
 an overlong line) are passed over and gone from the file at the next write; a Notepad BOM, spaces and CRLF are taken; a
 write goes through <file>.tmp, which takes the file's place and is not left behind; nothing is written when the file
-holds those items already (its time stays); a write that cannot be made says so and leaves nothing.
+holds those items already (its time stays); a write that cannot be made says so and leaves nothing; with no item (or only
+items without a name) the file is removed, there is nothing to do when it is not there, and a removal that cannot be made
+says so.
 python -I -B tests/test_item_buttons_ini.py   (needs a C compiler)
 """
 import shutil
@@ -87,13 +90,14 @@ static void put(const char *path, const char *text) {
 static const char *body(const char *text) { const char *nl = text ? strchr(text, '\n') : NULL; return nl ? nl + 1 : ""; }
 
 int main(int argc, char **argv) {
-    CHECK(argc == 2);
+    CHECK(argc == 3);
     for (int i = 0; i < IB_ITEMS; i++)   /* (made-up names; a few items have none) */
         if (i % 9 != 4) snprintf(name_text[i], sizeof name_text[i], "Item%02d", i), names[i] = name_text[i];
     char path[512], tmp[600], bad[600];
     snprintf(path, sizeof path, "%s/item_buttons.ini", argv[1]);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     snprintf(bad, sizeof bad, "%s/no such folder/item_buttons.ini", argv[1]);
+    const char *blocked = argv[2];   /* (a folder by the file's name, with a file in it: no removal takes it) */
 
     /* not there yet: none */
     back[0][0] = 7;
@@ -153,14 +157,30 @@ int main(int argc, char **argv) {
     none(items);
     CHECK(ib_ini_read(path, names, items) == 3 && !memcmp(items, back, sizeof items));
 
-    /* nothing at all: the first line alone */
+    /* nothing at all, or only items without a name: no file, and nothing to do when there is none */
     none(items);
+    CHECK(ib_named(names, items) == 0);
+    items[IB_ADULT][IB_B] = 4;   /* (no name) */
+    CHECK(ib_named(names, items) == 0);
+    CHECK(ib_ini_write(path, names, items) == 1 && !exists(path) && !exists(tmp));
+    CHECK(ib_ini_write(path, names, items) == 0 && !exists(path));
+    CHECK(ib_ini_read(path, names, back) == -1 && back[IB_ADULT][IB_B] == IB_NONE);
+    CHECK(ib_ini_write(bad, names, items) == 0 && !exists(bad));   /* (no folder: no file either) */
+    put(path, "# the first line alone\n");   /* (one made by hand: read as none, and removed) */
+    CHECK(ib_ini_read(path, names, back) == 0 && ib_ini_write(path, names, items) == 1 && !exists(path));
+
+    /* a file that cannot be removed: said, left as it was */
+    CHECK(ib_ini_write(blocked, names, items) == -1 && exists(blocked));
+
+    /* an item again: the file is back */
+    items[IB_CHILD][IB_X] = 3;
+    CHECK(ib_named(names, items) == 1);
     CHECK(ib_ini_write(path, names, items) == 1);
     text = slurp(path);
-    CHECK(text && text[0] == '#' && !strcmp(body(text), "") && ib_ini_read(path, names, back) == 0);
+    CHECK(text && text[0] == '#' && !strcmp(body(text), "child_x=Item03\n"));
 
     /* a file that cannot be written: said, nothing left */
-    CHECK(ib_ini_write(bad, names, back) == -1 && !exists(bad));
+    CHECK(ib_ini_write(bad, names, items) == -1 && !exists(bad));
 
     if (!fails) printf("PASS\n");
     return fails != 0;
@@ -182,15 +202,19 @@ class ItemButtonsIniTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="hookshot-item-buttons-ini-") as tmp:
             tmp = Path(tmp)
             (tmp / "t.c").write_text(PRELUDE + constants + "\n" + code + MAIN, encoding="utf-8")
-            folder = tmp / "user"
+            folder = tmp / "slot_03"
             folder.mkdir()
+            blocked = tmp / "blocked" / "item_buttons.ini"
+            blocked.mkdir(parents=True)
+            (blocked / "kept").write_text("kept\n", encoding="utf-8")
             binary = tmp / ("t.exe" if sys.platform == "win32" else "t")
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
                                     str(tmp / "t.c"), "-o", str(binary)], text=True, capture_output=True)
             self.assertEqual(build.returncode, 0, build.stderr)
-            run = subprocess.run([str(binary), str(folder)], text=True, capture_output=True, timeout=30)
+            run = subprocess.run([str(binary), str(folder), str(blocked)], text=True, capture_output=True, timeout=30)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             self.assertEqual(sorted(p.name for p in folder.iterdir()), ["item_buttons.ini"], "files left behind")
+            self.assertEqual(sorted(p.name for p in blocked.iterdir()), ["kept"], "a removal took a folder's file")
 
 
 if __name__ == "__main__":

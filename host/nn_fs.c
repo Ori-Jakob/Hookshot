@@ -399,6 +399,8 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     snprintf(fh->path, sizeof fh->path, "%s", g);
     G64(ARG(0)) = new_handle(fh);
     if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s)", g);
+    { void hos_oot_ib_save_file(const char *guest, int write);   /* (oot_item_buttons.c: a slot's progress.sav, a load or a save) */
+      hos_oot_ib_save_file(fh->path, want_write); }
     RET(0);
 }
 
