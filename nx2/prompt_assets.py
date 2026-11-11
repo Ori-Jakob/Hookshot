@@ -10,7 +10,8 @@ each face, one icon per pad input at U+F700 + 32 x HOS_PROMPT_* + HOS_PAD_* (gpu
 U+F700 + 32 x HOS_PROMPT_* + 24.., and each of those Switch buttons' and d-pad icons' code points in a cmap segment of its own: the
 game (host/prompts.c) points each one at the face's icon of the pad input bound to that button when it serves the font, and again
 when the face or the controls change while it runs, so the icons follow the controls, changed ones too. As built, the font's code
-points are the game's: its own images.
+points are the game's: its own images. It also has a comma and a plus (U+002C, U+002B) for the control guide's
+hotkey combo (guide_marks).
 
 The textures with button icons (the ocarina's notes, the letters on black, the controller in the pause menu) the same way, with
 Pillow, astc_encoder and texture2ddecoder: <out>/Common.bntx is the game's UI/Layout2Archive/Common bntx decompressed, and
@@ -273,6 +274,57 @@ def faces_font(otf, faces, label_otf=None):
     out = io.BytesIO()
     game.save(out)
     return out.getvalue(), widths
+
+
+# The control guide's comma and plus ("Fire [ZR], [L] + [A]": host/oot_item_buttons.c ib_combos writes them between the icons
+# only when host/prompts.c finds them in the font it serves). The guide's words are in the game's Normal font, whose Latin is
+# CetraDisplayPro-Regular drawn 1.17 times the size with its space 1.7 times as wide, at 48 where the guide's icons are 102
+CETRA = "Font2/Scalable/CetraDisplayPro-Regular.Nin_Ounce_NVN2.bfotf.zs"
+MARK_SCALE = 1.17 * 48 / 102
+MARK_SPACE = 1.7 * 48 / 102   # (times Cetra's space: a word space of the guide's, in the icons' units)
+MARK_MIDDLE = 300   # (the face and shoulder icons' vertical middle, font units: the plus is centred on it)
+
+
+def guide_marks(otf, text):
+    """the faces' font (faces_font's) with the control guide's comma at U+002C and plus at U+002B: Cetra's own (text: that
+    font, decrypted) at the size the guide's words have, a word space in each advance (after the comma, either side of the
+    plus), the comma on the baseline, the plus centred on the icons; the cmap made again as faces_font makes it"""
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.pens.transformPen import TransformPen
+    from fontTools.ttLib import TTFont
+    from fontTools.ttLib.tables.DefaultTable import DefaultTable
+
+    game, cetra = TTFont(io.BytesIO(otf)), TTFont(io.BytesIO(text))
+    gset, tset, tmap, cmap = game.getGlyphSet(), cetra.getGlyphSet(), cetra.getBestCmap(), dict(game.getBestCmap())
+    top = game["CFF "].cff.topDictIndex[0]
+    chars, order = top.CharStrings, list(game.getGlyphOrder())
+    ref = chars[cmap[SWITCH[0]]]   # (a glyph of the font's own: its private dictionary and subroutines)
+    space = cetra["hmtx"][tmap[0x20]][0] * MARK_SPACE
+    for code, name, spaces in ((0x2C, "guide_comma", (0, 1)), (0x2B, "guide_plus", (1, 1))):
+        src = tmap[code]
+        dy = 0
+        if code == 0x2B:
+            b = BoundsPen(tset)
+            tset[src].draw(b)
+            dy = round(MARK_MIDDLE - MARK_SCALE * (b.bounds[1] + b.bounds[3]) / 2)
+        width = round(cetra["hmtx"][src][0] * MARK_SCALE + sum(spaces) * space)
+        pen = T2CharStringPen(width - top.Private.nominalWidthX, gset)   # (a charstring holds its width less nominalWidthX)
+        tset[src].draw(TransformPen(pen, (MARK_SCALE, 0, 0, MARK_SCALE, round(spaces[0] * space), dy)))
+        chars.charStringsIndex.append(pen.getCharString(private=ref.private, globalSubrs=ref.globalSubrs))
+        chars.charStrings[name] = len(chars.charStringsIndex) - 1
+        top.charset.append(name)
+        order.append(name)
+        game["hmtx"].metrics[name] = (width, 0)
+        cmap[code] = name
+    game.setGlyphOrder(order)
+    gid = {n: i for i, n in enumerate(order)}
+    t = DefaultTable("cmap")
+    t.data = cmap4({c: gid[n] for c, n in cmap.items() if c <= 0xFFFF}, set(SWITCH) | set(STATIC))
+    game["cmap"] = t
+    out = io.BytesIO()
+    game.save(out)
+    return out.getvalue()
 
 
 # ---- the textures with button icons (UI/Layout2Archive/Common.*.bntx: 878 textures, ASTC 4x4 and BC4, the Switch 2's block-linear
@@ -1284,7 +1336,18 @@ def generate(a):
         label = unwrap(read_zs(a.romfs, prompt_keys.LABEL_FONT, dictionary))[1]
     except OSError:
         label = None
+    import zstandard
+    try:
+        cetra = unwrap(read_zs(a.romfs, CETRA, dictionary))[1]
+    except (OSError, struct.error, zstandard.ZstdError) as e:
+        cetra = None
+        print(f"prompts: {CETRA} could not be read ({e}): the control guide keeps spaces between its keys", file=sys.stderr)
     plain, widths = faces_font(otf, faces, label)
+    if cetra:
+        try:
+            plain = guide_marks(plain, cetra)
+        except (KeyError, ValueError, IndexError, struct.error) as e:   # (a Cetra without the glyphs)
+            print(f"prompts: the control guide keeps spaces between its keys ({CETRA}: {e!r})", file=sys.stderr)
     font = wrap(key, plain)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "External.bfotf"), "wb") as f:
