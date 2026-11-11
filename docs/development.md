@@ -402,6 +402,8 @@ number is not the obvious one:
 | `microphone` | 0 Off, 1 Default, 2 and up a microphone (the name in `microphone_device` decides which) |
 | `mouse_camera` | 0 As the stick, 1 Native |
 | `layout_preset` | 0 Nintendo, 1 Xbox / PC, 2 Swap Face, 3 Custom |
+| `item_assignable_buttons` | 0 Off, 1 On. The items themselves are not kept here but in `item_buttons.ini` in the user folder (`host/oot_item_buttons.c`). The HUD's four boxes with their hint, the Assign guides of the quick-switch menu and the pause menu's Items page, and the button icon on each Items page slot are layouts `nx2/item_buttons_layout.py` adds at build time (`item_buttons` in the game folder); the comma and the plus of the control guide's "ZR, L + A" are glyphs `nx2/prompt_assets.py` adds to the button prompts' font. On, the pause menu's pages turn with ZL and ZR alone (the filter hides L and R there) |
+| `item_button_hotkey` | 0 L, 1 R |
 
 The other rows are 0 Off and 1 On. Some are read at the start, before the menu exists, by the code that needs them:
 `handheld_profile` and `output_res` (`host/nn_applet.c`), `ultrawide` (`host/hos_main.c`), `robust_buffers`
