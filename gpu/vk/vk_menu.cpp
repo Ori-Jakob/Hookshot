@@ -1167,7 +1167,8 @@ MENU_HINTS(hn_prompts, 0,
 // opens the game's quick-switch menu
 MENU_HINTS(hn_item_buttons, 0, "The game's own: one item, on ZR.",
            "In play, hold the hotkey and press A, B, X or Y to use the item on that button, as ZR does. In the quick-switch "
-           "menu, the hotkey and one of them puts the highlighted item on it, or takes it off.")
+           "menu, the hotkey and one of them puts the highlighted item on it, or takes it off. Turned on now, the boxes "
+           "on the HUD and the menus' Assign guides come with the next start.")
 /// The Item button hotkey: the button chosen; variant 1: Item assignable buttons is Off (the row waits for it)
 const char* hn_item_hotkey(int v, int variant) {
     static const char* const t[] = {"Hold L for the items: it no longer opens the quick-switch menu. R still does.",

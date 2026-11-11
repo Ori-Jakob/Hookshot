@@ -123,6 +123,21 @@ static int auto_face(const char *name) {
     return !name[0] && keyboard_built && !hos_xinput_pads() ? HOS_PROMPT_KEYBOARD : face_of_name(name);
 }
 
+/* the Insert menu's Item assignable buttons as the game starts (hookshot_options.ini, read as choose_face reads its row's):
+   the item buttons' layouts are served only then (build_layouts) */
+static int item_buttons_on(const char *dir) {
+    char path[MAX_PATH], line[80];
+    int on = 0;
+    snprintf(path, sizeof path, "%shookshot_options.ini", dir);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "item_assignable_buttons=", 24)) on = atoi(line + 24) != 0;
+        fclose(f);
+    }
+    return on;
+}
+
 /* HOS_PROMPT_* (faces[]) */
 static int choose_face(const char *dir) {
     char path[MAX_PATH], line[80];
@@ -1254,9 +1269,10 @@ static void ring_places(const int *bind, int place[4]) {
    the game keeps it, find_layouts).
    With the HUD's item buttons built (item_buttons/Common.blarc, nx2/item_buttons_layout.py: the game's layouts with four item
    boxes and a hint added to the HUD's and a key guide to the quick-switch menu's, every other layout where the game has it,
-   so the runs fit it as they fit the game's) that is the base instead: served as item_buttons/Common.blarc.zs with the runs
-   or without, prompts/ or not, and the file a change while the game runs puts the bytes back from. Its stamp, written after
-   it, says it is whole, and goes into the key */
+   so the runs fit it as they fit the game's) and Item assignable buttons on as the game starts (item_buttons_on), that is
+   the base instead: served as item_buttons/Common.blarc.zs with the runs or without, prompts/ or not, and the file a change
+   while the game runs puts the bytes back from. Its stamp, written after it, says it is whole, and goes into the key. With
+   the row off, the game's own layouts: a player who never turns it on loads nothing of the item buttons' */
 static int build_layouts(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face = HOS_PROMPT_SWITCH;
@@ -1265,6 +1281,12 @@ static int build_layouts(char *out, size_t cap) {
     long sn = 0;
     snprintf(path, sizeof path, "%sitem_buttons/Common.blarc.stamp", dir);
     uint8_t *stamp = read_all(path, NULL, &sn);
+    if (stamp && !item_buttons_on(dir)) {
+        hos_log("prompts: the game's own layouts, Item assignable buttons being off (its HUD boxes and guides come with the "
+                "next start once it is on)");
+        free(stamp);
+        stamp = NULL;
+    }
     int bind[BINDS];
     current_binds(bind);
     Layout o;
