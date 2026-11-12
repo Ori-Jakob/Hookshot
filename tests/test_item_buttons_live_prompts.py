@@ -36,8 +36,8 @@ static int put(char *t, unsigned c) {   /* (UTF-8, three bytes) */
 }
 static int same(const char *s, int n, const char *k, int kn) { return ib_same_glyph((const uint8_t *)s, n, k, kn); }
 int main(void) {
-    int bind[HOS_SW_N];
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = -1;
+    int bind[BINDS];   /* (each Switch button's pad input, then its first key: none) */
+    for (int b = 0; b < HOS_SW_N; b++) bind[b] = -1, bind[HOS_SW_N + b] = 0;
     bind[HOS_SW_A] = HOS_PAD_SOUTH, bind[HOS_SW_ZR] = HOS_PAD_LSHOULDER, bind[HOS_SW_L] = HOS_PAD_RTRIGGER;
     for (int face = 0; face < HOS_PROMPT_N; face++) {
         for (int b = 0; b < HOS_SW_N; b++) {
@@ -112,9 +112,21 @@ def main():
     a = p.parse_args()
     prompts = (ROOT / "host" / "prompts.c").read_text(encoding="utf-8")
     buttons = (ROOT / "host" / "oot_item_buttons.c").read_text(encoding="utf-8")
-    defines = [re.search(r"^#define %s .*$" % name, prompts, re.M) for name in ("PAD_BASE", "FACE_CODES", "STATIC_AT", "BIND_BASE")]
-    check(all(defines), "host/prompts.c lacks PAD_BASE, FACE_CODES, STATIC_AT or BIND_BASE")
+    names = ("PAD_BASE", "FACE_CODES", "STATIC_AT", "BIND_BASE", "SLOT_BASE", "SLOTS", "STICK_KEYS", "STICK_GAME", "BINDS")
+    defines = [re.search(r"^#define %s .*$" % name, prompts, re.M) for name in names]
+    check(all(defines), "host/prompts.c lacks one of " + ", ".join(names))
     code = "\n".join([d.group(0) for d in defines] + [
+        "static int keyboard_built = 1;",
+        # (key_slot as tests/test_prompt_font_bind.py stands it in: each button and key a code of its own, in order)
+        "static unsigned char slot_button[SLOTS], slot_key[SLOTS];",
+        "static int nslots;",
+        "static int key_slot(int b, int k) {",
+        "    int s = 0;",
+        "    while (s < nslots && !(slot_button[s] == b && slot_key[s] == k)) s++;",
+        "    if (s == nslots) slot_button[s] = (unsigned char)b, slot_key[s] = (unsigned char)k, nslots++;",
+        "    return SLOT_BASE + s;",
+        "}",
+        re.search(r"static const uint16_t stick_code\[15\] = \{[^}]*\};", prompts).group(0),
         re.search(r"static const uint16_t switch_code\[HOS_SW_N\] = \{[^}]*\};", prompts).group(0),
         re.search(r"static const unsigned char switch_pad\[HOS_SW_N\] = \{[^}]*\};", prompts).group(0),
         re.search(r"static const uint16_t static_code\[3\] = \{[^}]*\};", prompts).group(0),

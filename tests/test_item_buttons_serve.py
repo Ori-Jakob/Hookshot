@@ -149,6 +149,7 @@ def main():
         line(src, r"^typedef struct \{ uint32_t off, len, idx; const uint8_t \*data; \} Run;.*$"),
         block(src, "static int run_cmp("), block(src, "static int run_order("), block(src, "static void add_run("),
         block(src, "static int write_patched("), block(src, "static void ring_places("),
+        line(src, r"^#define BINDS .*$"), block(src, "static int first_key("),
         block(src, "static void current_binds("), block(src, "static int in_runs("),
         span(src, r"typedef struct \{\n    char path\[MAX_PATH\];.*?\} Live;"),
         line(src, r"^static Live lay;.*$"),
