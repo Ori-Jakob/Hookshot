@@ -1276,7 +1276,8 @@ struct LateCopy {
     uint64_t wb;       // (the page's write-back value when planned: the same at the flush, or the copy falls back)
     uint32_t page;     // (the guest page: the flush checks its write-back, the fallback reads it)
     VkDeviceAddress mirror;   // (the page's start in that shadow, after the diff: the merge's words)
-    VkDeviceAddress snap;     // (the page's start in its pre-diff snapshot: the merge's reference)
+    VkBuffer snap_buf;        // (the page's pre-diff snapshot's buffer: each merge copies it, the word path writes its shadow)
+    uint64_t snap_off;        // (the page's start in that snapshot: the copy's source offset)
 };
 // (this thread's, between take_capture and memory_begin_submission of the recording in progress)
 struct LatePlan {
@@ -1367,20 +1368,59 @@ void snap_record(VkCommandBuffer cmd, const Pool& p, const std::vector<VkBufferC
 }
 /// (hookshot, #2655) The pre-diff shadow of a late page's write-back, and the use that keeps the entry until the reading
 /// submission is done (pools_mu held); false when the page was not one of that write-back's fill pages (no snapshot: the
-/// page was known then, and its post-diff shadow is no reference for the capture: the CPU wait)
-bool snap_lookup(uint64_t value, uint64_t lo, uint64_t at, uint64_t use, VkDeviceAddress& address) {
+/// page was known then, and its post-diff shadow is no reference for the capture: the CPU wait). The buffer and offset,
+/// not an address: every merge copies the page into its own scratch (the word path writes its shadow)
+bool snap_lookup(uint64_t value, uint64_t lo, uint64_t at, uint64_t use, VkBuffer& buf, uint64_t& off) {
     if (!value) return false;
     for (SnapEntry& e : snap_entries) {
         if (!e.buf || e.value != value) continue;
         for (const SnapRange& r : e.ranges) {
             if (r.lo != lo || at < r.at || at + ((uint64_t)1 << kPageShift) > r.at + r.len) continue;
             e.last_use = std::max(e.last_use, use);
-            address = e.address + r.off + (at - r.at);
+            buf = e.buf, off = r.off + (at - r.at);
             return true;
         }
         return false;
     }
     return false;
+}
+/// (hookshot, #2655) A merge's own copy of its snapshots: wb_diff.comp's word path writes its shadow (s) as well as its
+/// guest, so two captures of the same write-back sharing one snapshot would let the first merge patch it and the second,
+/// seeing v == s, skip the diff's words and keep stale bytes. One scratch a merge, reused once its submission is done.
+constexpr int kMergeScratchEntries = 4;
+struct MergeScratch {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    VkDeviceAddress address = 0;
+    uint64_t bytes = 0, value = 0, last_use = 0;
+};
+MergeScratch merge_scratch[kMergeScratchEntries];
+MergeScratch* merge_scratch_get(uint64_t need, uint64_t value) {
+    MergeScratch* spare = nullptr;
+    for (MergeScratch& s : merge_scratch) {
+        if (s.value > mem_completed || s.last_use > mem_completed) continue;
+        if (s.bytes >= need) { s.value = value, s.last_use = 0; return &s; }
+        if (!spare) spare = &s;   // (too small: recreated below, a larger merge's need)
+    }
+    if (!spare) return nullptr;   // (every scratch in use: the caller keeps the CPU wait)
+    if (spare->buf) destroy_buffer(spare->buf, spare->alloc);
+    spare->buf = VK_NULL_HANDLE, spare->alloc = nullptr, spare->address = 0, spare->bytes = 0;
+    if (!create_device_buffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                              spare->buf, spare->alloc)) {
+        spare->value = value;   // (no room: not retried until this one is done)
+        return nullptr;
+    }
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = spare->buf;
+    spare->address = vkGetBufferDeviceAddress(dev.device, &da);
+    if (!spare->address) {
+        destroy_buffer(spare->buf, spare->alloc);
+        spare->buf = VK_NULL_HANDLE, spare->value = value;
+        return nullptr;
+    }
+    spare->bytes = need, spare->value = value, spare->last_use = 0;
+    return spare;
 }
 /// (hookshot, #2655) The kept late pages merged in the recording's upload command buffer (the write-back's diff, word mode,
 /// with the pre-diff shadow as its shadow); false when the pass cannot be recorded and the caller keeps the CPU wait
@@ -1413,11 +1453,13 @@ bool late_copy_plan(Capture& c, uint64_t value) {
         if (p->buffer == VK_NULL_HANDLE || !late_shadow_eligible(p->shadow != VK_NULL_HANDLE, known)) return false;
         const uint32_t page = c.pages[r.dst >> kPageShift];
         const uint64_t wb = wb_page_value(page);
-        VkDeviceAddress snap = 0;
-        if (!snap_lookup(wb, p->lo, r.src, value, snap)) return false;   // (no pre-diff snapshot: the CPU wait, not a stale page)
+        VkBuffer snap_buf = VK_NULL_HANDLE;
+        uint64_t snap_off = 0;
+        if (!snap_lookup(wb, p->lo, r.src, value, snap_buf, snap_off))
+            return false;   // (no pre-diff snapshot: the CPU wait, not a stale page)
         p->last_value = std::max(p->last_value, value);   // (its import and mirror stay until the copy's submission is done)
         late_plan.copies.push_back(
-            {p->shadow, {r.src, r.dst, (uint64_t)1 << kPageShift}, p->lo, wb, page, p->shadow_address + r.src, snap});
+            {p->shadow, {r.src, r.dst, (uint64_t)1 << kPageShift}, p->lo, wb, page, p->shadow_address + r.src, snap_buf, snap_off});
     }
     late_plan.dst = c.buffer;
     late_plan.value = value;
@@ -4741,8 +4783,10 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
 
 namespace {
 /// (hookshot, #2655) See late_merge_record's declaration: the write-back's own diff, its word path, from the pre-diff
-/// snapshots. One chunk a 4 KB page: mirror = the post-diff shadow's page, shadow = its pre-diff snapshot's, guest = the
-/// page's slot in the capture. It writes the diff's words there, and the capture's bytes at the rest, stay.
+/// snapshots. One chunk a 4 KB page: mirror = the post-diff shadow's page, shadow = this merge's copy of the page's
+/// pre-diff snapshot, guest = the page's slot in the capture. It writes the diff's words there, and the capture's bytes at
+/// the rest, stay. The copy is this merge's own: the word path writes its shadow, and the next capture of the same
+/// write-back must still see the pre-diff words (the shared snapshot would be patched by this dispatch).
 bool late_merge_record(VkCommandBuffer cmd, const std::vector<LateCopy>& copies, VkBuffer dst, uint64_t value) {
     if (copies.empty() || !dst || !wb_diff_on() || !wbd_pipe_ready()) return false;
     VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -4751,14 +4795,25 @@ bool late_merge_record(VkCommandBuffer cmd, const std::vector<LateCopy>& copies,
     if (!guest) return false;
     WbdTable* t = wbd_table_get(copies.size() * sizeof(WbdChunk));
     if (!t || !t->map) return false;
+    MergeScratch* sc = merge_scratch_get(copies.size() << kPageShift, value);
+    if (!sc || !sc->address) return false;   // (no scratch: the caller keeps the CPU wait)
+    static thread_local std::vector<VkBufferCopy> rs;
+    for (size_t i = 0; i < copies.size();) {   // (consecutive pages of one snapshot entry: one copy call each)
+        const VkBuffer src = copies[i].snap_buf;
+        rs.clear();
+        for (; i < copies.size() && copies[i].snap_buf == src; i++)
+            rs.push_back({copies[i].snap_off, i << kPageShift, (uint64_t)1 << kPageShift});
+        vkCmdCopyBuffer(cmd, src, sc->buf, (uint32_t)rs.size(), rs.data());
+    }
     static thread_local std::vector<WbdChunk> chunks;
     chunks.clear();
-    for (const LateCopy& c : copies)
-        chunks.push_back({c.mirror, c.snap, guest + c.copy.dstOffset, (uint32_t)(((uint64_t)1 << kPageShift) / 4), 0});
+    for (size_t i = 0; i < copies.size(); i++)
+        chunks.push_back({copies[i].mirror, sc->address + (i << kPageShift), guest + copies[i].copy.dstOffset,
+                          (uint32_t)(((uint64_t)1 << kPageShift) / 4), 0});
     t->value = std::max(t->value, value);
     memcpy(t->map, chunks.data(), chunks.size() * sizeof(WbdChunk));
     flush_mapped(t->alloc, chunks.size() * sizeof(WbdChunk));
-    full_barrier(cmd, "barrier (late pages before the merge)");   // (the snapshots and the shadows from the submissions before)
+    full_barrier(cmd, "barrier (late pages before the merge)");   // (the snapshot copies and the shadows from the submissions before)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wbd_pipe.pipe);
     const struct { uint64_t table; uint32_t count, pad; uint64_t observations; } pc{t->address, (uint32_t)chunks.size(), 0, 0};
     vkCmdPushConstants(cmd, wbd_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);

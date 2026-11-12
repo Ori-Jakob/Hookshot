@@ -7,6 +7,9 @@ Window (a): a CPU write between the capture and the write-back's fill lands in t
 compares) but not in the capture: the merge keeps the captured bytes there. Window (b): a page the write-back knew, with no
 fill, has no snapshot: its post-diff shadow is no reference for the capture, and the plan sends it to the CPU wait.
 
+The word path writes its shadow (s) as well as its guest, so each merge runs on its own copy of the shared snapshot: two
+captures of the same write-back must both see the pre-diff words, and neither merge may patch what the other compares.
+
 python -I -B tests/test_capture_late_merge.py [--cxx g++]
 """
 import argparse
@@ -66,6 +69,14 @@ def main():
         raise SystemExit("late_merge_record: the write-back's diff is not run for the late pages")
     if "((uint64_t)1 << kPageShift) / 4" not in merge:
         raise SystemExit("late_merge_record: the chunks are not 4 KB of words (vecs = 0)")
+    scratch = block(source, "MergeScratch* merge_scratch_get(")
+    if "merge_scratch_get(" not in merge or "vkCmdCopyBuffer(cmd, src, sc->buf" not in merge:
+        raise SystemExit("late_merge_record: the snapshots are not copied into the merge's own scratch "
+                         "(the word path writes its shadow)")
+    if "sc->address +" not in merge or "copies[i].snap_off" not in merge:
+        raise SystemExit("late_merge_record: the chunks do not read the merge's own copy at the page's snapshot offset")
+    if "s.value > mem_completed || s.last_use > mem_completed" not in scratch:
+        raise SystemExit("merge_scratch_get: the scratch is not reused only once the submission that read it is done")
     if "VK_BUFFER_USAGE_TRANSFER_SRC_BIT" not in shadow:
         raise SystemExit("shadow_make: the shadow cannot be a copy source (the snapshot reads it)")
     usage = source[source.index("constexpr VkBufferUsageFlags kCapBufferUsage"):]
@@ -98,6 +109,14 @@ void late_merge_words(uint32_t* slot, const uint32_t* post_shadow, const uint32_
         if (v != snap[i]) slot[i] = v;
     }
 }
+// (wb_diff.comp's word path as the merge runs it: it writes its shadow (s) as well as its guest — each merge does that on
+// its own copy of the snapshot, never on the shared one)
+void merge_words(uint32_t* slot, const uint32_t* mirror, uint32_t* shadow_copy, size_t words) {
+    for (size_t i = 0; i < words; i++) {
+        const uint32_t v = mirror[i];
+        if (v != shadow_copy[i]) slot[i] = v, shadow_copy[i] = v;
+    }
+}
 int main() {
     // (window (a): the CPU writes words 1 and 2 after the capture, before the write-back reads guest memory; word 0 is the
     // GPU's. The fill has the later writes; the diff leaves them; the merge keeps the capture's bytes there and the GPU's 0.)
@@ -125,8 +144,28 @@ int main() {
     CHECK(after[0] == 99 && after[1] == 21 && after[2] == 30 && after[3] == 40);
     // (no snapshot: the plan must not merge from the post-diff shadow, whose words at 1 and 2 are the stale 20 and 30; the
     // CPU wait's guest copy is the exact result)
+    // (two captures of the same page while the same write-back is in flight: they share one pre-diff snapshot, and the
+    // word path writes its shadow — each merge runs on its own copy, so the first cannot patch what the second compares)
+    uint32_t shared[4], scratch_a[4], scratch_b[4], slot_a[4], slot_b[4];
+    std::memcpy(shared, fill, sizeof shared);   // (the write-back's one pre-diff snapshot)
+    std::memcpy(slot_a, capture, sizeof slot_a), std::memcpy(slot_b, capture, sizeof slot_b);
+    std::memcpy(scratch_a, shared, sizeof scratch_a);   // (the first merge's own copy)
+    merge_words(slot_a, mirror, scratch_a, 4);
+    std::memcpy(scratch_b, shared, sizeof scratch_b);   // (the second merge's own copy: the shared one is untouched)
+    merge_words(slot_b, mirror, scratch_b, 4);
+    CHECK(slot_a[0] == 99 && slot_b[0] == 99);          // (both captures get the diff's word)
+    CHECK(slot_b[1] == 20 && slot_b[2] == 30 && slot_b[3] == 40);   // (the second keeps the capture's bytes too)
+    // (the negative control: reading the shared snapshot directly, the first merge patches it and the second capture keeps
+    // its stale bytes — the bug the per-merge copy exists for)
+    uint32_t shared_direct[4], slot_x[4], slot_y[4];
+    std::memcpy(shared_direct, fill, sizeof shared_direct);
+    std::memcpy(slot_x, capture, sizeof slot_x), std::memcpy(slot_y, capture, sizeof slot_y);
+    merge_words(slot_x, mirror, shared_direct, 4);
+    merge_words(slot_y, mirror, shared_direct, 4);
+    CHECK(slot_x[0] == 99);
+    CHECK(slot_y[0] == 10);   // (stale: v == s now, the second merge writes nothing)
     std::puts("PASS: the late merge with the pre-diff snapshot: the capture's bytes at the diff's unchanged words, the GPU's "
-              "where it wrote; the no-fill page waits on the CPU");
+              "where it wrote; the no-fill page waits on the CPU; two captures of one write-back both keep the diff's words");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="capture-late-merge-") as tmp:
