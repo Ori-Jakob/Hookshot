@@ -57,7 +57,7 @@ def main():
                         "-I" + str(a.headers), *(["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie"] if a.sanitize else []),
                         str(cpp), "-o", str(exe)], check=True)
         for cache in ["coherent", "noncoherent"]:
-            for case in ["cpu", "astc", "atom", "reuse", "multiple", "failure", "empty-range",
+            for case in ["cpu", "astc", "atom", "reuse", "inflight-tail", "multiple", "failure", "empty-range",
                          "small-fallback", "unmapped-fallback", "unmapped-both", "fallback-astc", "fallback-reuse"]:
                 subprocess.run([str(exe), case, cache], check=True, timeout=15)
 
