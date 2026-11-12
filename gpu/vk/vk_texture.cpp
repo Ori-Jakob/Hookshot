@@ -431,8 +431,10 @@ uint64_t completed_value = 0;
 // (GPU writes into guest memory by buffers: GPU address -> (end, the submission that wrote it last))
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> gpu_wrote;
 std::mutex gpu_wrote_mu;
+// (#2780: what the GPU-write path copies against what the whole path used to: same events, so one run gives both)
+std::atomic<uint64_t> st_gw_events{0}, st_gw_kb{0}, st_gw_whole_kb{0};
 }  // namespace
-bool gpu_wrote_into(Texture& tex);
+bool gpu_wrote_into(Texture& tex, std::vector<std::pair<uint64_t, uint64_t>>* out = nullptr);
 namespace {
 Staging staging(uint64_t n, uint64_t align = 256) {
     // Separate slices may already be read by submitted parallel segments. A flush must not share their cache atom.
@@ -2580,9 +2582,14 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     tex->checked_epoch = epoch;
     static thread_local Ranges dirty;
     static const bool no_partial = env_on("RX_VK_NO_PARTIAL");   // (A/B: whole re-uploads)
-    // (a buffer the GPU wrote over its storage, done since: all of it again; the tiles of MKW's terrain are filled so
-    // and stayed the flat placeholder they were made with)
-    const bool gpu_dirty = tex->uploaded && gpu_wrote_into(*tex);
+    static const bool gpu_write_whole = env_on("RX_VK_GPU_WRITE_WHOLE");   // (A/B: all of it again on a GPU write)
+    // (a buffer the GPU wrote over its storage, done since: what it wrote again. A bind marks its whole range written
+    // though the shader may touch less of it, and the game's scratch lands on the storage of a finalized target: the
+    // 2560x1440 ones took 15 MB a frame for a 1.75 MB bind (#2780). The MKW terrain's tiles lie in the bound ranges,
+    // so they are still filled. RX_VK_GPU_WRITE_WHOLE=1: all of it again, as before)
+    const bool gpu_part = !no_partial && !gpu_write_whole && tex->uploaded && !tex->sparse;
+    const bool gpu_dirty = tex->uploaded && gpu_wrote_into(*tex, gpu_part ? &dirty : nullptr);
+    const bool gpu_partial = gpu_dirty && gpu_part && !dirty.empty();
     const bool partial = !no_partial && !gpu_dirty && tex->uploaded && !tex->gpu_written && !tex->released;
     // (a texture the GPU drew and the game finalized: only what the CPU wrote since then. Its memory never got the
     // GPU's texels, and a write before (another variable in the same page) re-uploaded garbage over a drawn LUT:
@@ -2595,6 +2602,20 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
             logf("vk: texture #%u %#llx %ux%u x%u NVN %#x the GPU drew, finalized by the game, sampled again at frame %llu (drawn at "
                  "%llu)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers, tex->nvn_format,
                  (unsigned long long)frame_no, (unsigned long long)tex->last_written);
+    }
+    if (gpu_partial) {   // (the CPU's writes since go in the same part: what the whole upload used to cover. Its ranges
+                         // are not found again later: the upload below moves upload_gen past them)
+        static thread_local Ranges cpu;
+        if (texture_dirty(*tex, since, cpu))
+            for (const auto& r : cpu) dirty.push_back(r);
+        if (dirty.size() > 1) {   // (the two sorted lists into one: overlaps() reads it in order)
+            std::sort(dirty.begin(), dirty.end());
+            size_t w = 0;
+            for (size_t i = 1; i < dirty.size(); i++)
+                if (dirty[i].first <= dirty[w].second) dirty[w].second = std::max(dirty[w].second, dirty[i].second);
+                else dirty[++w] = dirty[i];
+            dirty.resize(w + 1);
+        }
     }
     if (tex->uploaded && !gpu_dirty && !texture_dirty(*tex, since, dirty)) return tex;
     const uint32_t gen = memory_generation();
@@ -2688,23 +2709,37 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // 200 MB for a terrain array), not to be repeated every submission while the memory it needs is not there
     if (tex->bc && !tex->uploaded && tex->bc_retry_frame > frame_no) return tex;
     const auto up0 = std::chrono::steady_clock::now();
-    const bool up_ok = upload(*tex, partial || sparse_written ? &dirty : nullptr);
+    const bool up_part = partial || sparse_written || gpu_partial;
+    const bool up_ok = upload(*tex, up_part ? &dirty : nullptr);
     {   // (an upload over 15 ms: what it was, 60 of them)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - up0).count();
         static int slow_logged;
         if (ms > 15.0) programs_slow_upload(ms, tex->width, tex->height, tex->nvn_format);   // (RX_VK_LOG_PROGRAM_LIFE=1)
         if (ms > 15.0 && slow_logged++ < 60) {
             uint64_t part = 0;
-            if (partial) for (const auto& r : dirty) part += r.second - r.first;
+            if (up_part) for (const auto& r : dirty) part += r.second - r.first;
             logf("vk: slow upload %.1f ms: #%u %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, %llu of %llu KB%s", ms, tex->id,
                  (unsigned long long)tex->gpu, tex->width, tex->height, tex->depth, tex->layers, tex->levels,
                  tex->nvn_format, tex->astc ? " ASTC" : "",
                  tex->bc ? (linear_twin(tex->format) == VK_FORMAT_BC7_UNORM_BLOCK ? " (BC7)" : " (BC3)") : "",
-                 (unsigned long long)((partial ? part : tex->guest_size) >> 10), (unsigned long long)(tex->guest_size >> 10),
+                 (unsigned long long)((up_part ? part : tex->guest_size) >> 10), (unsigned long long)(tex->guest_size >> 10),
                  tex->uploaded ? " again" : "");
         }
     }
     if (up_ok) {
+        if (gpu_dirty) {   // (the GPU-write path's own tally: the part it took, and the whole it spared)
+            uint64_t part = 0;
+            if (gpu_partial) for (const auto& r : dirty) part += r.second - r.first;
+            const uint64_t whole = tex->guest_size;
+            const uint64_t n = st_gw_events.fetch_add(1, std::memory_order_relaxed) + 1;
+            st_gw_kb.fetch_add((gpu_partial ? part : whole) >> 10, std::memory_order_relaxed);
+            st_gw_whole_kb.fetch_add(whole >> 10, std::memory_order_relaxed);
+            if (n == 1 || n % 50 == 0)
+                logf("vk: gpu-write uploads: %llu (%llu MB copied, the whole image would have been %llu MB), %s",
+                     (unsigned long long)n, (unsigned long long)(st_gw_kb.load(std::memory_order_relaxed) >> 10),
+                     (unsigned long long)(st_gw_whole_kb.load(std::memory_order_relaxed) >> 10),
+                     gpu_partial ? "the part" : "whole");
+        }
         tex->upload_value = rec_value, tex->upload_seg = tl_seg;
         // (its storage joins the submit-time capture: what the game writes into it after a submit is not taken for it)
         // (any size: the capture copies only the pages the CPU wrote, and the big CPU-streamed textures were read as the
@@ -2719,7 +2754,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
             if (logged++ < 20 || (tex->guest_size > (4u << 20) && big[tex->gpu]++ < 3)) {
                 uint64_t part = 0, nz = 0, readable = 0;
                 for (const auto& r : dirty) part += r.second - r.first;
-                if (partial) {   // (what the CPU wrote: how much of it is not zero, and in which levels)
+                if (partial || gpu_partial) {   // (what was written again: how much of it is not zero, and in which levels)
                     std::vector<uint8_t> b;
                     char lv[96] = "";
                     int lvn = 0;
@@ -2740,8 +2775,10 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
                 logf("vk: texture %#llx %ux%ux%u x%u levels %u NVN %#x (%llu KB of storage) re-uploaded (its memory was "
                      "written; flags %#x): %s, %llu KB of it%s%s", (unsigned long long)tex->gpu, tex->width, tex->height,
                      tex->depth, tex->layers, tex->levels, tex->nvn_format, (unsigned long long)(tex->guest_size >> 10),
-                     tex->d.flags, gpu_dirty ? "a GPU write into its storage" : partial ? "what the CPU wrote" : "whole",
-                     (unsigned long long)((partial || sparse_written ? part : tex->guest_size) >> 10),
+                     tex->d.flags, gpu_dirty ? (gpu_partial ? "the part of its storage a GPU buffer wrote"
+                                                            : "a GPU write into its storage")
+                               : partial ? "what the CPU wrote" : "whole",
+                     (unsigned long long)((up_part ? part : tex->guest_size) >> 10),
                      tex->gpu_written ? ", over what the GPU wrote" : "", tex->released ? " (finalized since)" : "");
             }
         }
@@ -3644,7 +3681,8 @@ void texture_gpu_wrote(uint64_t gpu, uint64_t size) {
     if (gpu_wrote.size() > 65536) gpu_wrote.erase(gpu_wrote.begin());
 }
 /// A finished GPU write into the texture's storage it was not uploaded after (and notes it as seen)
-bool gpu_wrote_into(Texture& tex) {
+bool gpu_wrote_into(Texture& tex, Ranges* out) {
+    if (out) out->clear();
     std::lock_guard lk(gpu_wrote_mu);
     if (gpu_wrote.empty()) return false;
     const uint64_t lo = tex.gpu, hi = tex.gpu + std::max<uint64_t>(tex.guest_size, 1);
@@ -3652,8 +3690,14 @@ bool gpu_wrote_into(Texture& tex) {
     auto it = gpu_wrote.upper_bound(lo);
     if (it != gpu_wrote.begin()) --it;
     for (; it != gpu_wrote.end() && it->first < hi; ++it)
-        if (it->second.first > lo && it->second.second <= completed_value && it->second.second > tex.gpu_wrote_seen)
+        if (it->second.first > lo && it->second.second <= completed_value && it->second.second > tex.gpu_wrote_seen) {
             newest = std::max(newest, it->second.second);
+            if (out) {   // (the range of its storage the buffer covers, in the image's own offsets)
+                const uint64_t a = std::max(it->first, lo) - lo, b = std::min<uint64_t>(it->second.first, hi) - lo;
+                if (!out->empty() && out->back().second >= a) out->back().second = std::max(out->back().second, b);
+                else out->push_back({a, b});
+            }
+        }
     if (!newest) return false;
     tex.gpu_wrote_seen = newest;
     static int logged;
