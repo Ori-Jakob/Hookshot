@@ -164,6 +164,7 @@ static float host_wide_menus(uint32_t keep_mask) {   /* (MkwVkHost.wide_menus) *
     hos_wide_keep_mask = forced ? (uint32_t)strtoul(forced, NULL, 16) : keep_mask;
     return hos_wide_margin;
 }
+float hos_wide_cover(void);   /* hos_main.c */
 int hos_mouse_pointer(MkwVkPointer *out);   /* display.c, posix/display_sdl.c */
 int hos_sdl_gyro_status(void);   /* pad_sdl.c */
 extern const char *hos_romfs_dir;   /* nn_fs.c, set by hos_main.c */
@@ -201,6 +202,7 @@ static const MkwVkHost vk_host = {
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
     host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts, host_screen_size,
+    hos_wide_cover,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */

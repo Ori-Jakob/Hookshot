@@ -3432,7 +3432,7 @@ std::shared_ptr<std::vector<uint8_t>> shot_pixels(uint64_t at_value, int64_t at_
     const uint8_t* const sm = (const uint8_t*)shot_maps[at_present & 1];
     return std::make_shared<std::vector<uint8_t>>(sm, sm + (size_t)kShotW * kShotH * 4);
 }
-void do_present(const nvn_tex* t, const int crop[4]) {
+void do_present(const nvn_tex* t, const int crop[4], float cover) {
     static PendingShot pending;
     // (hookshot) NVIDIA Reflex (vk_reflex.cpp): this frame's simulation ended, its submission starts; on the way out (after the
     // present) the driver's sleep until the next frame should begin. AMD Anti-Lag 2 (vk_antilag.cpp) waits there as well: the
@@ -3509,12 +3509,12 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         const bool fg_after = framegen_on() && tex && !fg_inline;
         interpolated = framegen_on() && tex && fg_inline &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,
-                                       sh, crop);
+                                       sh, crop, cover);
         texture_frame(completed());
         full_barrier(r.cmd);
         presents++;
         presents_now = presents;
-        wide_sides_tick();
+        wide_sides_tick(cover);
         if (presents == 1) hang_watch_start(), gpu_hang_watch_start();
         {   // (EvilBoyce, diagnostics) RX_VK_WATCH_CPU=<present>:<gpu address>[,...] (hex addresses): from that present on, the
             // CPU's writes to those 4 KB pages logged with the writer's stack (host page watch: 12 reports)
@@ -3600,7 +3600,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             // (its slot is free again once the next submit's value is reached: that one comes after it)
             Recording& g = begin_recording(value + 1);
             interpolated = framegen_record(g.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample),
-                                           sw, sh, crop);
+                                           sw, sh, crop, cover);
             submit_recording(g, false);
         }
         // (frame generation at Off or Auto, where DLSS-G is not asked: its feature, if made, let go, vk_dlss.cpp)
@@ -4618,6 +4618,7 @@ struct Job {
     uint64_t queue = 0;         // (a submit's queue)
     int crop[4] = {0, 0, 0, 0};
     bool has_crop = false;
+    float cover = 0.0f;         // (a present's: ultrawide's loading cover as the game presented the frame, wide_cover_sample)
     nvn_prog prog;
     std::chrono::steady_clock::time_point queued;
 };
@@ -4685,7 +4686,7 @@ void replay_thread_main() {
         case JOB_PRESENT:   // (the frame's work whole before it is shown)
             drain(0);
             present_value = j.value;
-            do_present(j.has_tex ? &j.tex : nullptr, j.has_crop ? j.crop : nullptr);
+            do_present(j.has_tex ? &j.tex : nullptr, j.has_crop ? j.crop : nullptr, j.cover);
             break;
         case JOB_TEXTURE_RELEASED:   // (after the stopped work that may use it)
             drain(1);
@@ -4852,11 +4853,12 @@ void present(const nvn_tex* t, const int crop[4]) {
             drain(0);   // (the frame's work whole before it is shown)
             update_blocked();
             present_value = ++q_values;
-            return do_present(t, crop);
+            return do_present(t, crop, wide_cover_sample());
         }
-        return do_present(t, crop);
+        return do_present(t, crop, wide_cover_sample());
     }
     Job j{JOB_PRESENT};
+    j.cover = wide_cover_sample();
     if (t) j.tex = *t, j.has_tex = true;
     if (crop) std::memcpy(j.crop, crop, sizeof j.crop), j.has_crop = true;
     enqueue(std::move(j));
