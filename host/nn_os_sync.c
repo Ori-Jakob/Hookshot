@@ -597,9 +597,8 @@ HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     WakeConditionVariable(&cv->cv);
 }
 /* (hookshot) Broadcast: every waiter wakes. Left to the guest SDK, it signals the kernel key at cv+4, which no HLE waiter
-   sleeps on, so its waiters slept on until some Signal: the movie framework's ALooper::postReply (awaitResponse) and
-   LiveDataSource::queueBuffer / queueEOS (readAt_l), and NvOsConditionBroadcast. Horizon moves all the waiters onto the
-   mutex, so each is owed it, as a Signal's one is (cv_reserve: one mutex for all of them, at most 8 owed). */
+   sleeps on, so its waiters slept on until some Signal (the movie framework's reply and buffer queues, NVIDIA's OS layer:
+   untimed waits). Horizon moves all the waiters onto the mutex, so each is owed it, as a Signal's one is (cv_reserve: one mutex for all of them, at most 8 owed). */
 HLE(_ZN2nn2os26BroadcastConditionVariableEPNS0_21ConditionVariableTypeE) {
     Obj *cv = obj(ARG(0), K_COND);
     if (watched_cv(ARG(0))) watch_log("broadcast", watch_mutex(), ARG(0), c, NULL);
@@ -964,8 +963,8 @@ HLE(_ZN2nn2os21ReleaseLightSemaphoreEPNS0_18LightSemaphoreTypeE) { sema_release(
 /* (hookshot) the count overload, which OoT imports: left to the guest SDK it would bypass the host's state */
 HLE(_ZN2nn2os21ReleaseLightSemaphoreEPNS0_18LightSemaphoreTypeEi) { sema_release(obj(ARG(0), K_SEMA), (int)ARG(1)); }
 /* (hookshot) the timed and try acquires: left to the guest SDK they read its count words, which the HLE never writes, and
-   wait on a kernel key no HLE release signals. musl's sem_timedwait, NvOsSemaphoreWaitTimeout and nlib's
-   semaphore_trywait_for call TimedAcquireSemaphore. */
+   wait on a kernel key no HLE release signals (the C library's timed semaphore wait and NVIDIA's OS layer call
+   TimedAcquireSemaphore). */
 HLE(_ZN2nn2os21TimedAcquireSemaphoreEPNS0_13SemaphoreTypeENS_8TimeSpanE) { RET(sema_acquire_for(obj(ARG(0), K_SEMA), (int64_t)ARG(1))); }
 HLE(_ZN2nn2os26TimedAcquireLightSemaphoreEPNS0_18LightSemaphoreTypeENS_8TimeSpanE) { RET(sema_acquire_for(obj(ARG(0), K_SEMA), (int64_t)ARG(1))); }
 HLE(_ZN2nn2os24TryAcquireLightSemaphoreEPNS0_18LightSemaphoreTypeE) { RET(sema_acquire_for(obj(ARG(0), K_SEMA), 0)); }

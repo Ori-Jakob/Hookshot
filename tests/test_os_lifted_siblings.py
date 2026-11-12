@@ -2,9 +2,8 @@
 
 host/nn_os_sync.c replaces the nn::os condition variable and semaphore functions with host objects. Siblings left to the
 lifted SDK act on guest words the HLE never writes, and signal kernel keys no HLE waiter sleeps on:
-- BroadcastConditionVariable woke nobody (the movie framework's ALooper::postReply and LiveDataSource::queueBuffer, and
-  NvOsConditionBroadcast, call it);
-- TimedAcquireSemaphore (musl's sem_timedwait, NvOsSemaphoreWaitTimeout) never saw an HLE release.
+- BroadcastConditionVariable woke nobody (the movie framework and NVIDIA's OS layer call it);
+- TimedAcquireSemaphore (the C library's timed semaphore wait, NVIDIA's OS layer) never saw an HLE release.
 
 The fixture runs the real code cut from the source (handoff_on, cv_enter, cv_leave, cv_reserve, the Broadcast HLE,
 sema_acquire_for) over stubs: counted lock pairs and wake calls, and a fake clock whose wait can release the semaphore.
@@ -200,6 +199,10 @@ def main():
     for name, arg in SEMA_HLE.items():
         check(re.search(r"^HLE\(%s\) \{ RET\(sema_acquire_for\(obj\(ARG\(0\), K_SEMA\), %s\)\); \}$" % (name, re.escape(arg)), src, re.M),
               "%s is not the HLE's sema_acquire_for (left to the guest SDK, it never sees an HLE release)" % name)
+    # (the fixture stubs wait_until: its clamp, below INFINITE's 0xFFFFFFFF ms, is pinned here)
+    wait = block(src, "static int wait_until(Obj *o, int64_t deadline) {")
+    check("(DWORD)(ms < 0x7FFFFFFF ? ms : 0x7FFFFFFF)" in wait,
+          "wait_until no longer caps one sleep below 0xFFFFFFFF ms (INFINITE): a long finite wait could sleep forever")
     env = {k: v for k, v in os.environ.items() if not k.startswith("HOS_")}
 
     def build(tmp, name, **changed):
