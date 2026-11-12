@@ -2456,17 +2456,10 @@ def main(a=None):
         note_shader_list(work, romfs, os.path.join(out, "hookshot_shaders.bin"))
     # (hookshot) the button prompts of other controllers (host/prompts.c): the game's icon font redrawn per controller, with fontTools.
     # Without it the game shows its own icons
-    prompts = os.path.join(out, "prompts")
-    if importlib.util.find_spec("fontTools") is None:
-        shutil.rmtree(prompts, ignore_errors=True)
-        print("the button prompts of other controllers were not made (no fontTools): the game shows its own", flush=True)
-    elif run(PY + [os.path.join(HERE, "prompt_assets.py"), "--romfs", romfs, "--out", prompts] +
-             ([] if launcher else ["--incremental"]), check=False, output=sys.stderr):
-        print("the button prompts of other controllers were not made: the game shows its own", flush=True)
-        shutil.rmtree(prompts, ignore_errors=True)
     # (hookshot) the HUD's item buttons (host/oot_item_buttons_hud.c): the game's layouts with four item boxes and their hint
-    # added to the HUD's and an Assign guide to the quick-switch menu's, served by host/prompts.c. Without them the item
-    # buttons still work, with nothing on the HUD and no guide in the menu
+    # added to the HUD's and an Assign guide to the quick-switch menu's, served by host/prompts.c, which puts the prompts'
+    # runs over them as the game runs. Before the prompts' step, which keeps its output when its inputs are unchanged
+    # (tests/test_prompt_skip.py). Without them the item buttons still work, with nothing on the HUD and no guide in the menu
     item_buttons = os.path.join(out, "item_buttons")
     shutil.rmtree(item_buttons, ignore_errors=True)
     if importlib.util.find_spec("zstandard") is None:
@@ -2477,6 +2470,14 @@ def main(a=None):
         print("the HUD's boxes for the item buttons and the quick-switch menu's Assign guide were not made: the buttons work "
               "without them", flush=True)
         shutil.rmtree(item_buttons, ignore_errors=True)
+    prompts = os.path.join(out, "prompts")
+    if importlib.util.find_spec("fontTools") is None:
+        shutil.rmtree(prompts, ignore_errors=True)
+        print("the button prompts of other controllers were not made (no fontTools): the game shows its own", flush=True)
+    elif run(PY + [os.path.join(HERE, "prompt_assets.py"), "--romfs", romfs, "--out", prompts] +
+             ([] if launcher else ["--incremental"]), check=False, output=sys.stderr):
+        print("the button prompts of other controllers were not made: the game shows its own", flush=True)
+        shutil.rmtree(prompts, ignore_errors=True)
     icon = os.path.join(ROOT, "assets", "hookshot.png")
     if LINUX and os.path.exists(icon):   # (the window's icon: host/posix/display_sdl.c)
         copy_writable(icon, os.path.join(out, "hookshot.png"))   # (a second build overwrites the first's)
