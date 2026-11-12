@@ -228,6 +228,9 @@ bool memory_capture_now(uint64_t value, uint64_t completed);   // (hookshot: mad
 /// one submission, and the uploads (where a late page's copy goes) run before the command buffers: the copy could then
 /// run before the write-back it owes its bytes to
 bool replay_burst_open();
+/// The newest timeline value among the burst's pieces (0: no burst open): a write-back tagged below it is in an earlier
+/// submission, one tagged with it is in the burst's own recording
+uint64_t replay_burst_value();
 /// The submission the replay records next (bindings note it: a pool's mirror is in use until it is done)
 void memory_recording_value(uint64_t value, uint64_t completed);
 // (hookshot) The recording being made, as vk_replay.cpp numbers them (Recording::part), and the newest of them in which

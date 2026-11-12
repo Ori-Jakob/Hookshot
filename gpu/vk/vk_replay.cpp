@@ -2889,6 +2889,7 @@ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
 
 /// (hookshot, #2655) see vk_internal.h
 bool replay_burst_open() { return burst_open; }
+uint64_t replay_burst_value() { return burst_open ? burst_value : 0; }
 
 // Called while replaying, including workers joined before the next signal is issued.
 // The current logical value may already have completed before a stopped queue resumes.

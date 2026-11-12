@@ -143,6 +143,7 @@ static void sync_settle() { looks++; schedule(); }
 
 int main() {
     const uint64_t P = 4096;
+    check(wb_page_value(0) == 0, "a page never written back has no value");
     // submission 10 in three parts (parts 1-3, recordings 1-3): page 1 written back in part 1, page 2 in part 3
     Recording a{10, 1}, b{10, 2}, c{10, 3};
     wb_pages_note(1 * P, 2 * P, 10, 1);

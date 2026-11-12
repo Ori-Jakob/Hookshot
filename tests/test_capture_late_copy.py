@@ -1,7 +1,11 @@
 """The late pages' GPU copies (gpu/vk/vk_memory.cpp late_copy_runs): the runs in the capture's page order, from the pool
 that holds each page, into its slot; the fallback: a page no imported pool holds has no GPU source, so the caller keeps
 the CPU wait and copies it once the write-back landed (never a stale copy); and the seams the back end links through:
-replay_burst_open at namespace scope, the parallel guard and the pending-pages cap.
+replay_burst_open and replay_burst_value at namespace scope, the parallel guard and the pending-pages cap.
+
+Also the sweep's rules: a burst blocks a copy only for the write-backs tagged with its own value (an older one's is
+already on the queue); a page is copied from the pool's write-back shadow, not the live guest buffer, and only when the
+shadow holds it; the flush re-checks the shadow and the write-back, and falls back to the CPU wait when either moved.
 
 python -I -B tests/test_capture_late_copy.py [--cxx clang++]
 """
@@ -68,8 +72,23 @@ def main():
     replay = args.replay_source.read_text(encoding="utf-8")
     if not namespace_scope(replay, "bool replay_burst_open()"):
         raise SystemExit("replay_burst_open is defined in an anonymous namespace: internal linkage, the back end does not link")
-    if "bool replay_burst_open();" not in args.internal_header.read_text(encoding="utf-8"):
+    if not namespace_scope(replay, "uint64_t replay_burst_value()"):
+        raise SystemExit("replay_burst_value is defined in an anonymous namespace: internal linkage, the back end does not link")
+    header = args.internal_header.read_text(encoding="utf-8")
+    if "bool replay_burst_open();" not in header:
         raise SystemExit("vk_internal.h does not declare replay_burst_open")
+    if "uint64_t replay_burst_value();" not in header:
+        raise SystemExit("vk_internal.h does not declare replay_burst_value")
+    if "late_burst_blocks(c.late_value, replay_burst_open(), replay_burst_value())" not in plan or "replay_burst_open() ||" in plan:
+        raise SystemExit("late_copy_plan: a burst refuses every copy: only the write-backs tagged with its own value need the CPU wait")
+    if plan.find("p->shadow") < 0 or plan.find("shadow_known") < 0 or "late_shadow_eligible(" not in plan:
+        raise SystemExit("late_copy_plan: the late pages are not copied from the pool's write-back shadow")
+    if "p->buffer, {r.src" in plan:
+        raise SystemExit("late_copy_plan: the late pages are copied from the live guest buffer (it changes under the copy)")
+    if flush.find("late_copy_still_valid(") < 0 or flush.find("wb_page_value(") < 0 or flush.find("imported.find(") < 0:
+        raise SystemExit("late_copy_flush: the shadow and the page's write-back are not checked again")
+    if flush.find("vk_timeline_wait(") < 0 or flush.find("guarded_copy(") < 0:
+        raise SystemExit("late_copy_flush: a page whose shadow moved has no CPU wait and copy")
     gpu_on = block(source, "bool gpu_late_on()")
     if gpu_on.find("RX_VK_PARALLEL") < 0 or gpu_on.find("RX_VK_PARALLEL") > gpu_on.find("RX_VK_CAPTURE_GPU_LATE"):
         raise SystemExit("gpu_late_on: RX_VK_CAPTURE_GPU_LATE=1 bypasses the parallel replay's guard")
@@ -77,6 +96,9 @@ def main():
         raise SystemExit("late_copy_plan: no cap on the pending late pages")
     runs_fn = block(source, "bool late_copy_runs(")
     late_run = block(source, "struct LateRun {") + ";"
+    burst_rule = block(source, "bool late_burst_blocks(")
+    shadow_rule = block(source, "bool late_shadow_eligible(")
+    valid_rule = block(source, "bool late_copy_still_valid(")
     fixture = (
         r'''
 #include <algorithm>
@@ -91,6 +113,12 @@ constexpr uint64_t kPageShift = 12;   // (vk_memory.cpp's: 4 KB pages)
         + late_run
         + "\n"
         + runs_fn
+        + "\n"
+        + burst_rule
+        + "\n"
+        + shadow_rule
+        + "\n"
+        + valid_rule
         + r'''
 int main() {
     const std::vector<uint32_t> pages = {0x100, 0x101, 0x102, 0x300, 0x500, 0x103};
@@ -113,7 +141,24 @@ int main() {
     // (an index past the capture's pages, and no late pages at all)
     CHECK(!late_copy_runs({6}, pages, pools, runs) && runs.empty());
     CHECK(late_copy_runs({}, pages, pools, runs) && runs.empty());
-    std::puts("PASS: the late pages' runs in capture order, each pool's offsets and the fallback");
+    // (an older burst: the write-back is in a submission before this recording, the copy goes on the GPU)
+    CHECK(!late_burst_blocks(7, true, 9));
+    // (the write-back tagged with the burst's own value: its uploads run before its write-backs, the CPU waits)
+    CHECK(late_burst_blocks(9, true, 9));
+    CHECK(late_burst_blocks(10, true, 9));
+    // (no burst: the copy is planned as before)
+    CHECK(!late_burst_blocks(7, false, 0));
+    // (no shadow for the pool, or a page its shadow does not know: no GPU source, the CPU waits)
+    CHECK(!late_shadow_eligible(false, false));
+    CHECK(!late_shadow_eligible(true, false));
+    CHECK(late_shadow_eligible(true, true));
+    // (at the flush: the shadow still there, its page known, the write-back it owed unchanged; else the CPU fallback)
+    CHECK(late_copy_still_valid(true, true, 7, 7));
+    CHECK(!late_copy_still_valid(false, true, 7, 7));
+    CHECK(!late_copy_still_valid(true, false, 7, 7));
+    CHECK(!late_copy_still_valid(true, true, 7, 8));
+    std::puts("PASS: the late pages' runs in capture order, each pool's offsets and the fallback; the burst, shadow and "
+              "flush rules");
 }
 '''
     )
