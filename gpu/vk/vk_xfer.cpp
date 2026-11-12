@@ -31,6 +31,24 @@ struct Sub {
     uint32_t down = 0;   // (a level the image left out, copied into its first at 1 / 2^down the size)
 };
 
+/// A format's optimal-tiling features, asked of the driver once per format (a scaled copy checks both of its sides)
+VkFormatFeatureFlags tiling_features(VkFormat f) {
+    static std::atomic<uint64_t> known[256];   // (the core formats; bit 63: asked already)
+    if ((uint32_t)f >= 256) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, f, &p);
+        return p.optimalTilingFeatures;
+    }
+    uint64_t v = known[f].load(std::memory_order_relaxed);
+    if (!(v >> 63)) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, f, &p);
+        v = 1ull << 63 | p.optimalTilingFeatures;
+        known[f].store(v, std::memory_order_relaxed);
+    }
+    return (VkFormatFeatureFlags)v;
+}
+
 int warn_budget[16];
 void warn(int key, const char* what) {
     if (warn_budget[key]++ < 3) logf("vk: %s", what);
@@ -331,11 +349,8 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         // (what Vulkan allows a blit: BLIT_SRC/BLIT_DST, one format class on both sides, the same format for depth or
         // stencil, single-sampled images, and linear filtering only where the source format supports it; outside that
         // the result is undefined, and some drivers write garbage or lose the device)
-        VkFormatProperties fs{}, fd{};
-        vkGetPhysicalDeviceFormatProperties(dev.physical, s.tex->format, &fs);
-        vkGetPhysicalDeviceFormatProperties(dev.physical, d.tex->format, &fd);
-        if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
-            !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+        if (!(tiling_features(s.tex->format) & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+            !(tiling_features(d.tex->format) & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
             format_class(s.tex->format) != format_class(d.tex->format) ||
             (!color && s.tex->format != d.tex->format) ||
             s.tex->samples != VK_SAMPLE_COUNT_1_BIT || d.tex->samples != VK_SAMPLE_COUNT_1_BIT) {
@@ -351,7 +366,7 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         bl.dstOffsets[0] = offset(d);
         bl.dstOffsets[1] = {d.x + (int32_t)d.w, d.y + (int32_t)d.h, d.z + (int32_t)d.d};
         const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color &&
-                            (fs.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+                            (tiling_features(s.tex->format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
                             format_class(s.tex->format) == 0;
         vkCmdBlitImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
