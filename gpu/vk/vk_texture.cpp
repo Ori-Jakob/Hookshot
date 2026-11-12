@@ -274,7 +274,9 @@ std::deque<Dead> dead;
 // replaying, once a second while the camera moves (RTX 5070, Kokiri Forest: 10,500 images made and destroyed in 4.5 minutes,
 // 17 GB). Now a render target's image whose texture is gone waits in a pool by its create info, views and all, and a new texture
 // of the same create info takes it; it is put into GENERAL from UNDEFINED and cleared as a new one is (create), so nothing it held
-// shows. Only images made for a target (texture_get's !for_sampling) are pooled. The pool is bounded (RX_VK_TARGET_POOL_MB, default
+// shows. An image the GPU is done with is pooled as it is evicted, not at the next present: the next frame, recorded between
+// the two, is where a target of its shape would have made a new image instead (issue 2180). Only images made for a target
+// (texture_get's !for_sampling) are pooled. The pool is bounded (RX_VK_TARGET_POOL_MB, default
 // 256; 0: none, every image destroyed as before; and none while VRAM is near what the driver allows), and an image unused in it for
 // 120 presents is destroyed, at most 16 a present ----
 struct Pooled {
@@ -1845,18 +1847,23 @@ bool texture_dirty(Texture& tex, uint32_t gen, Ranges& out) {
 
 uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to them goes stale)
 
+/// (A render target's image goes to the pool now rather than at the next present: between the two, the next frame is
+/// recorded, and a target of its shape made there missed it and made a new image, while the old one was destroyed unused
+/// later, 120 presents on (issue 2180's A/B: 65% more targets let go, 83% more images made new). The eviction only hands
+/// over one the GPU is done with (it skips those in flight), so the next frame's target takes it)
 void destroy_later(Texture& tex) {
     destroy_gen++;
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     if (tex.pool_key && tex.allocation && tex.sparse_chunks.empty() && pool_cap()) {   // (a render target's: to the pool, its views too)
         d.pool_key = tex.pool_key, d.view_map = std::move(tex.views), d.bytes = tex.bytes + tex.pad;
         tex.views.clear();
+        pool_put(d);
     } else {
         for (auto& kv : tex.views)
             if (kv.second) d.views.push_back(kv.second);
+        d.memory = tex.sparse_chunks;
+        dead.push_back(std::move(d));
     }
-    d.memory = tex.sparse_chunks;
-    dead.push_back(std::move(d));
     for (const auto& attachment : tex.block_attachments)
         dead.push_back(Dead{tex.last_value, attachment.image, attachment.allocation, {}, {}});
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
@@ -4477,8 +4484,11 @@ void texture_frame(uint64_t completed) {
             if (o->second != tex && o->second->last_written > tex->last_frame) return true;
         return false;
     };
-    // (hookshot-amd) a render target of one level and layer whose storage another render target drew over from another start
-    // after its last use (target_overlap.h): the transient targets above. Its texels are gone from that memory on the console too
+    // (hookshot-amd) a render target of one level and layer whose storage newer render targets drew over from another start
+    // after its last use (target_overlap.h): the transient targets above. Its texels are gone from that memory on the console
+    // too. Their shares are added up, several over parts of it: judged one by one (an eighth each) they left the big ones, and
+    // what was missed grew to 3-4 GB of target images (issue 2180). A newer target inside it is a view of a part of it, not a
+    // new target (5bfa6aa, PR #899): counted, a live scene target would go on its sub-rects being drawn as views
     const auto drawn_over_shifted = [&](const Texture* tex) {
         if (!dead_targets || !tex->gpu_written || !tex->first_render_frame || !tex->guest_size || tex->levels != 1 ||
             tex->layers != 1 || tex->depth > 1)
@@ -4486,11 +4496,11 @@ void texture_frame(uint64_t completed) {
         const uint64_t lo = tex->gpu, hi = tex->gpu + tex->guest_size;
         auto it = std::lower_bound(by_start.begin(), by_start.end(), lo > longest ? lo - longest : 0,
                                    [](const Texture* t, uint64_t g) { return t->gpu < g; });
+        target_overlap::DrawnOver over;
         for (; it != by_start.end() && (*it)->gpu < hi; ++it)
-            if (*it != tex && target_overlap::shifted_over(lo, hi, tex->last_frame, (*it)->gpu, (*it)->gpu + (*it)->guest_size,
-                                                           (*it)->last_written))
-                return true;
-        return false;
+            if (*it != tex)
+                over.add(lo, hi, tex->last_frame, (*it)->gpu, (*it)->gpu + (*it)->guest_size, (*it)->last_written);
+        return over.an_eighth(hi - lo);
     };
     // (the transient targets: a frame's own, not sampled again, their storage drawn over by another since. 16 frames left
     // ~500 MB of them in Hyrule Castle Town's market at 20 fps (59 768 x 432 RGBA16F, 135 384 x 384, 41 1536 x 864 at a
