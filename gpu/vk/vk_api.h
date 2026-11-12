@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 21
+#define MKWVK_API_VERSION 22
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA, HOS_OPT_CHEAT_SPEED };
 /* (hookshot) the Gameplay tab's Text size (host/oot_text_size.c): 0 the game's, 1 110%, 2 125%, 3 150%, 4 175% */
 enum { HOS_OPT_TEXT_SIZE = 10 };
@@ -195,6 +195,10 @@ typedef struct MkwVkHost {
     /* (version 20, hookshot) the main screen's size in pixels, as host/hos_main.c takes its shape at the start (Windows: the
        primary's; Linux: SDL's primary desktop), for the Insert menu's Aspect ratio and Output resolution rows: 0 when not known */
     int (*screen_size)(int *width, int *height);
+    /* (version 22, hookshot) ultrawide: how far the loading cover between two areas is closed, 0 (not shown) to 1 (black),
+       while the game draws it in the middle 16:9 with the menus (wide_menus's keep_mask) and so leaves the sides open
+       (host/hos_main.c hos_wide_cover); 0 when it covers the whole picture itself. Asked at each present */
+    float (*wide_cover)(void);
 } MkwVkHost;
 
 /* One completed temporal-upscale sample; all zero while inactive. */
