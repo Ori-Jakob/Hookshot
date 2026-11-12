@@ -996,12 +996,15 @@ void cap_exit_note() {
     cap_shutting_down = true;
 }
 int cap_prewarm_index(uint64_t size) { return size <= (32ull << 20) ? 0 : size <= (64ull << 20) ? 1 : size <= (128ull << 20) ? 2 : size <= (192ull << 20) ? 3 : -1; }
+// (the CPU writes a capture's slots (TRANSFER_SRC for the mirrors' and the shadow's copies), and a late page's slot the
+// GPU writes (TRANSFER_DST: see "the late pages' copies", #2655))
+constexpr VkBufferUsageFlags kCapBufferUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 void cap_spare_make(uint64_t size, int index) {
     VkBuffer b = VK_NULL_HANDLE;
     VmaAllocation a = nullptr;
     void* m = nullptr;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!cap_shutting_down.load() && create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, b, a, &m, !env_on("RX_VK_CAP_BLOCKS")) && m) {
+    if (!cap_shutting_down.load() && create_buffer_cached(size, kCapBufferUsage, b, a, &m, !env_on("RX_VK_CAP_BLOCKS")) && m) {
         static std::atomic<int> told{0};
         if (told++ < 8)
             logf("vk: a %llu MB capture buffer made ahead in %.1f ms, off the game's thread (RX_VK_CAP_PREWARM)", (unsigned long long)(size >> 20),
@@ -1055,7 +1058,7 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     }
     size = cap_buf_size(need);
     map = nullptr;
-    return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
+    return create_buffer_cached(size, kCapBufferUsage, buffer, alloc, &map,
                                 size >= (16ull << 20) && !env_on("RX_VK_CAP_BLOCKS")) && map;
 }
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
@@ -1123,8 +1126,8 @@ bool capture_on() {
 std::atomic<bool> captures_seen{false};
 std::atomic<uint64_t> cap_view_gen{1};   // (bumped when a capture is published or a page is stamped: cached reads go stale)
 void cap_view_bump() { cap_view_gen.fetch_add(1, std::memory_order_release); }
-double st_tk_all, st_tk_stamp, st_tk_copy, st_tk_late, st_tk_lock;   // (memory_take_capture's parts, ms)
-int64_t st_tk_late_n;   // (the takes that waited for the GPU for their late pages)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
+double st_tk_all, st_tk_stamp, st_tk_copy, st_tk_late, st_tk_late_gpu, st_tk_lock;   // (memory_take_capture's parts, ms)
+int64_t st_tk_late_n, st_tk_late_gpu_n;   // (the takes that waited for the GPU for their late pages, and those copied on the GPU)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
 // ---- texture storage in the capture ----
 // The textures' storage the replay uploads from joins the capture, and what the capture took of it is kept (the
@@ -1217,6 +1220,152 @@ void publish_tex_spans(uint64_t frame) {
 }
 } // namespace
 
+// ---- (hookshot, #2655) the late pages' copies on the GPU ----
+// A page the CPU wrote that a submission still on the GPU writes back (capture_make's late pages) was copied again by
+// the replay once the write-back had landed, and the replay waited for it there: ~2 ms a frame at OoT's 600 submits a
+// frame, with the game's thread ahead and the GPU idle behind it. The write-back is part of a submission already on the
+// queue, and a copy recorded now in the submission being recorded runs after it, in queue order: the late pages are
+// copied on the GPU instead, into their capture's slots, and the CPU waits only where that is not possible (a page no
+// imported pool holds, a page the texture shadow reads at this take, a burst's recording (its uploads would run before
+// its own write-backs), a parallel replay (its first recording is never submitted), RX_VK_CAPTURE_GPU_LATE=0). The copies
+// are recorded in the recording's upload command buffer (its first use: a barrier after every submission before it),
+// before the mirror syncs that may read the same capture buffer.
+namespace {
+struct LateRun {
+    uint32_t pool;   // (index in the caller's pools list)
+    uint64_t src;    // (the page's offset in that pool's guest buffer)
+    uint64_t dst;    // (its slot in the capture's buffer: a 4 KB page, at the page's index in the capture)
+};
+/// (hookshot, #2655) The late pages' runs, in the order of `late` (indexes into `pages`; pools: (lo, hi), sorted by lo).
+/// False: a late page in no imported pool (no GPU source: the caller waits on the CPU for the write-back and copies it,
+/// as before: never a copy of bytes the write-back has not landed). tests/test_capture_late_copy.py
+bool late_copy_runs(const std::vector<uint32_t>& late, const std::vector<uint32_t>& pages,
+                    const std::vector<std::pair<uint64_t, uint64_t>>& pools, std::vector<LateRun>& runs) {
+    runs.clear();
+    for (uint32_t i : late) {
+        if ((uint64_t)i >= pages.size()) return false;
+        const uint64_t addr = (uint64_t)pages[i] << kPageShift;
+        auto it = std::upper_bound(pools.begin(), pools.end(), addr,
+                                   [](uint64_t a, const std::pair<uint64_t, uint64_t>& p) { return a < p.first; });
+        if (it == pools.begin()) return false;
+        --it;
+        if (addr + ((uint64_t)1 << kPageShift) > it->second) return false;
+        runs.push_back({(uint32_t)(it - pools.begin()), addr - it->first, (uint64_t)i << kPageShift});
+    }
+    return true;
+}
+bool gpu_late_on() {
+    static const bool v = [] {
+        const char* p = getenv("RX_VK_PARALLEL");
+        if (p && atoi(p) > 1) return false;   // (a parallel replay's first recording is not submitted: its command buffers never run)
+        if (const char* e = getenv("RX_VK_CAPTURE_GPU_LATE")) return !env_value_off(e);
+        return true;
+    }();
+    return v;
+}
+struct LateCopy {
+    VkBuffer src;
+    VkBufferCopy copy;
+};
+// (this thread's, between take_capture and memory_begin_submission of the recording in progress)
+struct LatePlan {
+    VkBuffer dst = VK_NULL_HANDLE;
+    std::vector<LateCopy> copies;
+    std::vector<uint64_t> pages;   // (the guest pages they bring: a CPU read of one as submitted waits for them)
+    uint64_t value = 0;            // (the submission that records them)
+};
+thread_local LatePlan late_plan;
+std::atomic<bool> late_plan_any{false};
+// (the late pages whose copy is on the GPU: from take_capture until its submission is done the capture's slot holds the
+// bytes guest memory had before the write-back, and a CPU read of the page as submitted reads guest memory instead)
+struct LatePage {
+    uint64_t page, value;
+};
+std::mutex late_pages_mu;   // (a leaf: taken under pools_mu, and alone)
+std::vector<LatePage> late_pages;
+std::atomic<bool> late_pages_any{false};
+std::atomic<size_t> late_pages_n{0};   // (late_pages.size(), read without the lock: a backlog means no submission drained it)
+constexpr size_t kLatePagesMax = 4096;   // (a replay that never submits its plan: the CPU wait instead of growing forever)
+/// (hookshot, #2655) The runs of c's late pages, resolved under pools_mu; false when one has no GPU source, or is in the
+/// texture shadow's ranges (its copy is read at this take, before the GPU's would land), and the caller waits on the CPU
+bool late_copy_plan(Capture& c, uint64_t value) {
+    if (!gpu_late_on() || replay_burst_open() || !c.buffer || !c.map || c.late.empty() || c.copied.empty()) return false;
+    if (late_pages_n.load(std::memory_order_relaxed) >= kLatePagesMax) return false;   // (the CPU wait: no unbounded backlog)
+    if (tex_capture_on()) {
+        std::lock_guard sk(shadow_mu);
+        for (uint32_t i : c.late)
+            if (in_tex_merged((uint64_t)c.pages[i] << kPageShift)) return false;
+    }
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> pools;
+    static thread_local std::vector<Pool*> owners;
+    static thread_local std::vector<LateRun> runs;
+    std::lock_guard lk(pools_mu);
+    pools.clear(), owners.clear();
+    for (auto& kv : imported) pools.push_back({kv.second.lo, kv.second.hi}), owners.push_back(&kv.second);
+    if (!late_copy_runs(c.late, c.pages, pools, runs)) return false;
+    late_plan.copies.clear(), late_plan.pages.clear();
+    for (const LateRun& r : runs) {
+        Pool* p = owners[r.pool];
+        if (p->buffer == VK_NULL_HANDLE) return false;
+        p->last_value = std::max(p->last_value, value);   // (its import and mirror stay until the copy's submission is done)
+        late_plan.copies.push_back({p->buffer, {r.src, r.dst, (uint64_t)1 << kPageShift}});
+        late_plan.pages.push_back(c.pages[r.dst >> kPageShift]);
+    }
+    late_plan.dst = c.buffer;
+    late_plan.value = value;
+    late_plan_any.store(true, std::memory_order_relaxed);
+    return true;
+}
+/// The planned copies, in the recording's upload command buffer: after every submission before it (the write-back's),
+/// before the mirror syncs that may read the same capture buffer
+void late_copy_flush() {
+    if (!late_plan_any.exchange(false, std::memory_order_relaxed)) return;
+    if (late_plan.copies.empty()) return;
+    VkCommandBuffer cmd = upload_command_buffer();
+    static thread_local std::vector<VkBufferCopy> rs;
+    for (size_t i = 0; i < late_plan.copies.size();) {   // (a run a source pool: the late pages usually share one)
+        const VkBuffer src = late_plan.copies[i].src;
+        rs.clear();
+        for (; i < late_plan.copies.size() && late_plan.copies[i].src == src; i++) rs.push_back(late_plan.copies[i].copy);
+        vkCmdCopyBuffer(cmd, src, late_plan.dst, (uint32_t)rs.size(), rs.data());
+    }
+    full_barrier(cmd, "barrier (late pages on the GPU)");
+    {
+        std::lock_guard lk(late_pages_mu);
+        const uint64_t done = vk_timeline_completed();
+        for (size_t i = 0; i < late_pages.size();) {   // (the ones that landed with no CPU read of them: done)
+            if (late_pages[i].value <= done) late_pages.erase(late_pages.begin() + (ptrdiff_t)i);
+            else i++;
+        }
+        for (uint64_t p : late_plan.pages) late_pages.push_back({p, late_plan.value});
+        late_pages_n.store(late_pages.size(), std::memory_order_relaxed);
+        late_pages_any.store(!late_pages.empty(), std::memory_order_relaxed);
+    }
+    late_plan.copies.clear(), late_plan.pages.clear();
+}
+/// A late page whose GPU copy has not run yet: the capture's slot holds the bytes from before the write-back (true: the
+/// CPU read of it as submitted takes guest memory). Once the copy has run the buffer's cached lines are invalidated
+bool late_page_pending(uint64_t page, VmaAllocation alloc, uint64_t size) {
+    if (!late_pages_any.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lk(late_pages_mu);
+    const uint64_t done = vk_timeline_completed();
+    bool pending = false;
+    for (size_t i = 0; i < late_pages.size();) {
+        const LatePage& l = late_pages[i];
+        if (l.value > done) {
+            if (l.page == page) pending = true;
+            i++;
+            continue;
+        }
+        if (l.page == page) invalidate_mapped(alloc, size);
+        late_pages.erase(late_pages.begin() + (ptrdiff_t)i);
+    }
+    late_pages_n.store(late_pages.size(), std::memory_order_relaxed);
+    late_pages_any.store(!late_pages.empty(), std::memory_order_relaxed);
+    return pending;
+}
+} // namespace
+
 void memory_note_texture_upload(uint64_t guest, uint64_t size) {
     if (!size || guest >= (1ull << 40) || size > (1ull << 40) || !tex_capture_on()) return;   // (hookshot: no wrap below)
     uint64_t lo, hi;
@@ -1280,6 +1429,7 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
         return true;
     static std::atomic<int64_t> reads{0}, pages_from{0};
     int64_t from = 0;
+    bool late_pending = false;   // (a capture holds the page but its copy has not run: no "no capture holds it" answer kept)
     {
         std::lock_guard lk(pools_mu);
         for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
@@ -1287,11 +1437,15 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             if (!e.gen || e.gen != page_gen(page)) continue;
             auto b = cap_bufs.find(e.gen);
             if (b == cap_bufs.end() || !b->second.map) continue;
+            if (late_page_pending(page, b->second.alloc, b->second.size)) {   // (its copy on the GPU has not run: guest memory stands)
+                late_pending = true;
+                continue;
+            }
             const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
         }
-        if (page0 == page1 && from == 0) {   // (in no capture: guest memory stands for its next words too)
+        if (page0 == page1 && from == 0 && !late_pending) {   // (in no capture: guest memory stands for its next words too)
             submitted_page.page = page0;
             submitted_page.pgen = page_gen(page0);
             submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
@@ -1764,8 +1918,10 @@ std::unique_ptr<Capture> capture_make() {
     // words from the frame before; the mirror sync of the page put them back over the GPU's newer ones, and the exposure
     // stepped for a frame (one-frame flashes, 40-120 a minute in Kokiri Forest). Only the copies of such pages wait, for the
     // last submission writing them back: not every frame's present. That wait held the game's thread (~8% of its time at a
-// ~2150-draw scene), so those pages are copied again by the replay, before it uses this capture, once the submission is
-// done: the replay waits instead, while the game goes on. RX_VK_CAPTURE_WAIT=1: the game's thread waits, 0: no wait
+// ~2150-draw scene), so the replay took it instead, copying them again once the submission was done. #2655: it copies
+    // them on the GPU now, in the submission that uses the capture, after the write-back's (take_capture, "the late pages'
+    // copies"); the CPU waits only where that cannot be (RX_VK_CAPTURE_GPU_LATE=0: as before).
+    // RX_VK_CAPTURE_WAIT=1: the game's thread waits, 0: no wait
     if (n > 0) {
         static const int cap_wait = getenv("RX_VK_CAPTURE_WAIT") ? atoi(getenv("RX_VK_CAPTURE_WAIT")) : 2;
         uint64_t v = 0;
@@ -1905,19 +2061,25 @@ int64_t memory_late_wait_ns() { return st_late_wait_ns.load(std::memory_order_re
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
-        // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
+        // (timed apart: the replay thread waited here for the GPU, the more often the fewer pools have a mirror. With
         // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
-        // 35-45 fps instead of 55, issue 995)
+        // 35-45 fps instead of 55, issue 995. Now their copies go on the GPU, in this submission's uploads, after the
+        // write-back's submission (see "the late pages' copies"); the wait is left for what that cannot take)
         const auto tw = std::chrono::steady_clock::now();
-        vk_timeline_wait(c->late_value);
-        st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
-        st_late_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
-                                  std::memory_order_relaxed);   // (hookshot: the frame trace's late_wait_ms)
-        st_tk_late_n++;
-        uint8_t* const base = (uint8_t*)host->guest_base();
-        for (uint32_t i : c->late)
-            guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
-        flush_mapped(c->alloc, c->nbytes);
+        if (late_copy_plan(*c, value)) {
+            st_tk_late_gpu += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+            st_tk_late_gpu_n++;
+        } else {
+            vk_timeline_wait(c->late_value);
+            st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+            st_late_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
+                                      std::memory_order_relaxed);   // (hookshot: the frame trace's late_wait_ms)
+            st_tk_late_n++;
+            uint8_t* const base = (uint8_t*)host->guest_base();
+            for (uint32_t i : c->late)
+                guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+            flush_mapped(c->alloc, c->nbytes);
+        }
     }
     const auto tl = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
@@ -2036,12 +2198,14 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         st_tk_stamp += std::chrono::duration<double, std::milli>(tk1 - tk_locked).count();
         st_tk_all += std::chrono::duration<double, std::milli>(tk2 - tk0).count();
         if (++n % 600 == 0) {
-            logf("vk: a capture taken (ms): all %.3f; GPU wait for late pages %.3f (%lld of 600 takes), pools lock %.3f, retires "
+            logf("vk: a capture taken (ms): all %.3f; late pages copied on the GPU %.3f (%lld of 600 takes), GPU wait for them %.3f "
+                 "(%lld takes), pools lock %.3f, retires "
                  "and stamps %.3f, bytes copied %.3f; %zu kept (%llu MB), %zu spare buffers, %zu texture pages copied (%llu MB)",
-                 st_tk_all / 600, st_tk_late / 600, (long long)st_tk_late_n, st_tk_lock / 600, st_tk_stamp / 600, st_tk_copy / 600,
+                 st_tk_all / 600, st_tk_late_gpu / 600, (long long)st_tk_late_gpu_n, st_tk_late / 600, (long long)st_tk_late_n,
+                 st_tk_lock / 600, st_tk_stamp / 600, st_tk_copy / 600,
                  cap_bufs.size(), (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
                  (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
-            st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_lock = 0, st_tk_late_n = 0;
+            st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_late_gpu = st_tk_lock = 0, st_tk_late_n = st_tk_late_gpu_n = 0;
         }
     }
     return true;
@@ -3607,6 +3771,7 @@ void trims_settle() {
 }
 
 void memory_begin_submission() {
+    late_copy_flush();   // (the late pages' copies this recording takes over from the CPU: before its uploads' first barrier)
     std::lock_guard lk(pools_mu);
     reap_mirrors();
     retired_imports_give_back();

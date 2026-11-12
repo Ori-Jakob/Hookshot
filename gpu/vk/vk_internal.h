@@ -224,6 +224,10 @@ void memory_capture_submit();
 bool memory_take_capture(uint64_t value, uint64_t completed);
 int64_t memory_late_wait_ns();   // (hookshot: RX_VK_FRAME_TRACE's late_wait_ms)
 bool memory_capture_now(uint64_t value, uint64_t completed);   // (hookshot: made and taken at once)
+/// (hookshot, #2655) A burst (vk_replay.cpp) is open: its pieces' write-backs and the command buffers they record are in
+/// one submission, and the uploads (where a late page's copy goes) run before the command buffers: the copy could then
+/// run before the write-back it owes its bytes to
+bool replay_burst_open();
 /// The submission the replay records next (bindings note it: a pool's mirror is in use until it is done)
 void memory_recording_value(uint64_t value, uint64_t completed);
 // (hookshot) The recording being made, as vk_replay.cpp numbers them (Recording::part), and the newest of them in which
