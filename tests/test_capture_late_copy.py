@@ -65,7 +65,7 @@ def main():
         raise SystemExit("take_capture: the GPU copy is not planned before the CPU wait (the wait is the fallback)")
     if "vk_timeline_wait(" in plan:
         raise SystemExit("late_copy_plan waits for the GPU: the copy is deferred to the recording")
-    if "upload_command_buffer()" not in flush or "vkCmdCopyBuffer(cmd, src, late_plan.dst" not in flush:
+    if "upload_command_buffer()" not in flush or "late_merge_record(" not in flush:
         raise SystemExit("late_copy_flush: the copies are not recorded in the submission's upload command buffer")
     if "late_page_pending(" not in read:
         raise SystemExit("memory_read_as_submitted: a late page's slot is read before its GPU copy lands")

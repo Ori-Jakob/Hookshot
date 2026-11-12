@@ -74,8 +74,8 @@ using VmaAllocation = VmaAllocationT*;
 using VkDevice = uint64_t;
 using VkBufferUsageFlags = uint32_t;
 constexpr VkBuffer VK_NULL_HANDLE = 0;
-constexpr uint32_t VK_BUFFER_USAGE_TRANSFER_DST_BIT = 1, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 2,
-                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT = 4;
+constexpr uint32_t VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 1, VK_BUFFER_USAGE_TRANSFER_DST_BIT = 2,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 4, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT = 8;
 constexpr int VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO = 0;
 constexpr int VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU = 1;
 struct VkBufferDeviceAddressInfo {
