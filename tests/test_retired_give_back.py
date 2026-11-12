@@ -28,6 +28,9 @@ def check_source():
                    # (what is queued is not asked for twice, by this valve or by imports_give_back's)
                    "retired_give_back::settled(used, dead_import_bytes), budget, high, low)",
                    "if (retired_mode() == retired_give_back::Mode::GRACE) used = retired_give_back::settled(used, dead_import_bytes);",
+                   'static const int cap_mb = env_int("RX_VK_IMPORT_CAP_MB", -1);',
+                   "const uint64_t cap = retired_give_back::live_budget(budget, (env_high && *env_high) || (env_low && *env_low), cap_mb);",
+                   "const uint64_t want = retired_give_back::want(used, cap, high, low);",
                    "dead_import_bytes += p.hi - p.lo;",
                    "dead_import_bytes -= std::min(dead_import_bytes, dead_imports.front().bytes);"):
         if needle not in src:
@@ -37,6 +40,9 @@ def check_source():
     for old in ("atoi(", 'getenv("RX_VK_KEEP_RETIRED")'):
         if old in give:
             raise SystemExit("retired_imports_give_back reads a switch the old way again: " + old)
+    # (a retired pool whose mirror was refused has none either: its import goes too, or it stays pinned for the session)
+    if "(p.mstate == Pool::MIRROR_NONE || p.mstate == Pool::MIRROR_REFUSED) && !p.inherit_pending" not in give:
+        raise SystemExit("retired_imports_give_back keeps the import of a retired pool whose mirror was refused, for good")
     mode = src[src.index("retired_give_back::Mode retired_mode() {"):]
     mode = mode[:mode.index("\n}\n")]
     if "#ifdef _WIN32\n    constexpr bool windows = true;\n#else\n    constexpr bool windows = false;\n#endif" not in mode:

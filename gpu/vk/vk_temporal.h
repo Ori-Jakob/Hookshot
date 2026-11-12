@@ -117,9 +117,10 @@ struct TemporalEngine {
     bool (*start)();
     /// Ready to scale rw x rh into ow x oh, made again when its sizes or settings changed (cmd: what that records). in_w and
     /// in_h: how large the inputs are to be (the most the render size can be for what it made). 1 ready, 2 ready and made
-    /// just now (a new history), 0 not this frame (*why: the reason), -1 failed for good (*why too)
-    int (*prepare)(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, uint32_t* in_w, uint32_t* in_h,
-                   const char** why);
+    /// just now (a new history), 0 not this frame (*why: the reason), -1 failed for good (*why too).
+    /// native_aa requests the engine's native anti-aliasing feature even if an upscale feature accepts these dimensions.
+    int (*prepare)(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool native_aa,
+                   uint32_t* in_w, uint32_t* in_h, const char** why);
     /// Records the frame: false when it failed (for good: the game's upscale from then on)
     bool (*evaluate)(VkCommandBuffer cmd, const TemporalFrame& f);
     /// What it made, let go (its feature or context): the chain unused for a while, or another engine chosen. Work in flight

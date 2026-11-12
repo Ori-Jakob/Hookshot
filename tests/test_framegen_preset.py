@@ -71,6 +71,8 @@ int temporal_resets = 0;
 void temporal_reset_failure() { ++temporal_resets; }
 void prompts_at_once(const Row&) {}
 int step_output_choice(int id, int dir) { return id + dir; }
+// (the Aspect ratio row moves the Output resolution to one of its shape's sizes, output_for_aspect: not what this checks)
+int output_for_aspect(int) { return opts.output_res; }
 const char* tx_framegen(int) { return ""; }
 const char* hn_framegen(int, int) { return ""; }
 const char* tx_preset(int) { return ""; }

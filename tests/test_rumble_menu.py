@@ -97,6 +97,8 @@ void temporal_reset_failure() { ++temporal_resets; }
 void prompts_at_once(const Row&) {}
 // (set_row steps the Output row through vk_menu.cpp's step_output_choice (#1144): not what this checks)
 int step_output_choice(int id, int dir) { return id + dir; }
+// (the Aspect ratio row moves the Output resolution to one of its shape's sizes, output_for_aspect: not what this checks)
+int output_for_aspect(int) { return opts.output_res; }
 %(set_row)s
 /* (menu_tick's arrows: Left, Right, and Enter as Right; a click on the value's left or right half presses them) */
 void arrow(Row& r, bool right) { %(arrow)s }

@@ -146,9 +146,19 @@ sums() {   # release id -> SHA256SUMS of the release's other files, sorted by na
 }
 
 uploaded() {   # release id -> the SHA256SUMS on the release (nothing when there is none)
-    local asset
-    asset=$(assets "$1" | jq -r '.[] | select(.name == "SHA256SUMS") | .id')
-    if [[ -n $asset ]]; then gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$asset" || true; fi
+    local asset i file
+    file=$(mktemp)
+    # (looked up again when its read fails: the nightly's other platform's run replaces it, under a new id, between
+    # this run's listing and its read, and an empty answer here made each run upload it again, over the other's read)
+    for i in 1 2 3; do
+        asset=$(assets "$1" | jq -r '.[] | select(.name == "SHA256SUMS") | .id')
+        [[ -n $asset ]] || break
+        if gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$asset" >"$file"; then
+            cat "$file"
+            break
+        fi
+    done
+    rm -f "$file"
 }
 
 finish() {

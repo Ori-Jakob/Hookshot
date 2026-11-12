@@ -11,6 +11,8 @@ namespace {
 
 using retired_give_back::Mode;
 using retired_give_back::due;
+using retired_give_back::kLiveBudgetCap;
+using retired_give_back::live_budget;
 using retired_give_back::mode;
 using retired_give_back::settled;
 using retired_give_back::want;
@@ -50,7 +52,16 @@ static_assert(want(6 * kGB, 8 * kGB, kHigh, kLow) == 0, "75%: under the high wat
 static_assert(want(8 * kGB / 100 * 85, 8 * kGB, kHigh, kLow) == 0, "at the high watermark, not past it");
 static_assert(want(7 * kGB, 8 * kGB, kHigh, kLow) == 7 * kGB - 8 * kGB / 100 * 75, "past it: down to the low watermark");
 static_assert(want(8 * kGB, 8 * kGB, 0, kLow) == 0, "RX_VK_IMPORT_HIGH=0: off");
+static_assert(want(8 * kGB, 0, kHigh, kLow) == 0, "budget 0 (RX_VK_IMPORT_CAP_MB=0): off");
 static_assert(settled(7 * kGB, kGB) == 6 * kGB && settled(kGB, 2 * kGB) == 0, "what is queued is as good as freed");
+static_assert(live_budget(7503 * kMB, false) == 7503 * kMB, "under 12 GB (16 GB PC / Deck): the heap's own budget, unchanged");
+static_assert(live_budget(15434 * kMB, false) == kLiveBudgetCap, "32 GB PC, default: capped at 4500 MB (high ~3825 MB, low ~3375 MB)");
+static_assert(live_budget(15434 * kMB, true) == 15434 * kMB, "RX_VK_IMPORT_HIGH or RX_VK_IMPORT_LOW set: the heap's full budget");
+static_assert(live_budget(15434 * kMB, false, 0) == 0, "RX_VK_IMPORT_CAP_MB=0 on >= 12 GB: off, as on main");
+static_assert(live_budget(7503 * kMB, false, 0) == 7503 * kMB, "RX_VK_IMPORT_CAP_MB=0 under 12 GB: keeps the < 12 GB behaviour");
+static_assert(live_budget(15434 * kMB, false, 6000) == 6000 * kMB, "RX_VK_IMPORT_CAP_MB=6000: tunable cap in MB");
+static_assert(want(3878 * kMB, live_budget(15434 * kMB, false), kHigh, kLow) == 3878 * kMB - 3375 * kMB,
+              "3878 MB used on a 15434 MB heap: past 85% of the 4500 MB cap, gives back down to 75% (3375 MB)");
 
 struct Retired { uint64_t bytes; int64_t at_ms; bool imported = true; };
 

@@ -10,8 +10,10 @@ Linux only. Builds saves_dir and what it calls, from the source as it is, over h
 twice (the move, then the start after) on folders of its own:
 
 - a link, written in full or from where it stands, is made again in the new place to the same folder, whose files stay;
-- so is one deeper in (user/save/<user id>); one to an entry that moves too names it in the new place, and one that names
-  nothing goes as it was written;
+- so is one deeper in (user/save/<user id>); one to an entry that moves too names it in the new place, written in full
+  or not, and whether the folder lists it before or after that entry (written in full, it used to name the old place
+  when the entry had gone first: the order is the file system's, so CI failed now and then); one that names nothing goes
+  as it was written;
 - from another drive too, when this PC has one to try (/dev/shm);
 - a user/ that is a link itself is used as it is;
 - with an entry the new place has already, nothing moves;
@@ -127,8 +129,12 @@ def main():
         (c.user / "save" / USER_ID / "account.sav").write_text("my save", encoding="ascii")
         (c.user / "save" / "latest").symlink_to(USER_ID)
         (c.user / "last").symlink_to(c.user / "save" / USER_ID)
+        # (the folder's order is the file system's: with this many, some are listed after save/, which has gone by then)
+        firsts = ["last-%s" % ch for ch in "abcdefghijklmnopqrstuvwxyz0123456789"]
+        for name in firsts:
+            (c.user / name).symlink_to(c.user / "save" / USER_ID)
         c.moved("save/latest")
-        for link in (c.new / "save" / "latest", c.new / "last"):
+        for link in [c.new / "save" / "latest", c.new / "last"] + [c.new / name for name in firsts]:
             c.check(link.is_symlink() and link.resolve() == (c.new / "save" / USER_ID).resolve(), "%s names another folder" % link.name)
 
         c = case("a link that names nothing")

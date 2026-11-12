@@ -302,7 +302,8 @@ class LinuxBuilderDlssTests(unittest.TestCase):
 
     def test_build_and_appimage_package_dlss_sources(self):
         build_py = (ROOT / "nx2" / "build.py").read_text(encoding="utf-8")
-        self.assertIn('vk_prebuilt = "" if NGX_SDK else os.environ.get("HOOKSHOT_VK_PREBUILT", "")', build_py)
+        self.assertIn('return "" if NGX_SDK else os.environ.get("HOOKSHOT_VK_PREBUILT", "")', build_py)
+        self.assertIn('vk_prebuilt = prebuilt_renderer()', build_py)
         appimage = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
         for piece in ("cp scripts/ngx_sdk.py", "cp -a gpu/vk gpu/compat gpu/third_party", "third_party/imgui", "libstdc++.a"):
             self.assertIn(piece, appimage)

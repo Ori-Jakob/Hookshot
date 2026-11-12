@@ -31,6 +31,7 @@ font's size (big-endian), each XORed with the same key as the font. The .zs file
 of Pack/ZsDic.pack.zs.
 """
 import argparse
+import contextlib
 import hashlib
 import importlib
 import importlib.metadata
@@ -38,9 +39,12 @@ import io
 import json
 import os
 import platform
+import shutil
+import stat
 import struct
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)   # (python -I leaves the script folder off)
@@ -1055,7 +1059,11 @@ def prompt_outputs(out):
 def prompts_before(out, key):
     """None means the complete outputs still match; otherwise the reason they need making again."""
     try:
-        with open(os.path.join(out, PROMPT_KEY), encoding="utf-8") as f:
+        try:
+            f = open(os.path.join(out, PROMPT_KEY), encoding="utf-8")
+        except FileNotFoundError:
+            return "no stamp yet"
+        with f:
             note = json.load(f)
         if not isinstance(note, dict) or not isinstance(note.get("inputs"), dict) or not isinstance(note.get("outputs"), dict):
             return "invalid stamp"
@@ -1071,9 +1079,119 @@ def prompts_before(out, key):
     return None
 
 
+def prompt_directory_matches(expected, actual):
+    return (stat.S_ISDIR(actual.st_mode) and not getattr(actual, "st_file_attributes", 0) & 0x400
+            and expected.st_ino != 0 and os.path.samestat(expected, actual))
+
+
+@contextlib.contextmanager
+def prompt_owner(folder, create=False):
+    """Hold the owner's lock; POSIX sweepers pass the already checked directory descriptor."""
+    with contextlib.ExitStack() as handles:
+        relative = {}
+        if os.name != "nt":
+            directory = folder
+            if not isinstance(directory, int):
+                directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                handles.callback(os.close, directory)
+            path, relative = ".owner", {"dir_fd": directory}
+        else:
+            path = os.path.join(folder, ".owner")
+        if not create:
+            st = os.stat(path, follow_symlinks=False, **relative)
+            if not stat.S_ISREG(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
+                raise OSError("not a regular owner file")
+        flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0) | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags, 0o600, **relative), "r+b") as owner:
+            if not create and (not st.st_ino or not os.path.samestat(st, os.fstat(owner.fileno()))):
+                raise OSError("owner file changed")
+            if create:
+                owner.write(b"\0")
+                owner.flush()
+            owner.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(owner.fileno(), msvcrt.LK_LOCK if create else msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(owner, fcntl.LOCK_EX | (0 if create else fcntl.LOCK_NB))
+            if create:
+                owner.write(b"1")   # readiness is published only while the lock is held
+                owner.flush()
+            elif owner.read(1) != b"1":
+                raise OSError("ownership not established")
+            yield   # closing releases the lock, including on an exception; process death releases it too
+
+
+def remove_old_prompt_staging(path, modified):
+    """Windows: age alone authorizes a cleanup attempt; an OS refusal is nonfatal."""
+    if time.time() - modified >= 24 * 60 * 60:
+        try:
+            shutil.rmtree(path)
+        except OSError as e:
+            print(f"prompts: kept staging directory {path} ({e})", flush=True)
+
+
+def sweep_prompts(out):
+    """Reclaim staging: checked descriptors/owner locks on POSIX, a 24-hour age rule on Windows."""
+    out = os.path.abspath(out)
+    parent = os.path.dirname(out)
+    anchored = os.name != "nt"
+    if anchored and (not getattr(shutil.rmtree, "avoids_symlink_attacks", False) or
+                     not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW")):
+        print("prompts: staging cleanup skipped (descriptor-safe removal unavailable)", flush=True)
+        return
+    try:
+        with contextlib.ExitStack() as handles:
+            parent_fd = None
+            if anchored:
+                parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                handles.callback(os.close, parent_fd)
+            with os.scandir(parent_fd if anchored else parent) as entries:
+                for entry in entries:
+                    path = os.path.join(parent, entry.name)
+                    if not entry.name.startswith(".prompts-") or path == out:
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISDIR(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
+                            continue
+                        if not anchored:
+                            remove_old_prompt_staging(path, st.st_mtime)
+                            continue
+                        if not st.st_ino:
+                            raise OSError("staging directory identity unavailable")
+                        with contextlib.ExitStack() as candidate:
+                            directory = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                            candidate.callback(os.close, directory)
+                            if not prompt_directory_matches(st, os.fstat(directory)):
+                                raise OSError("staging directory changed")
+                            try:
+                                os.stat(".owner", dir_fd=directory, follow_symlinks=False)
+                            except FileNotFoundError:
+                                if time.time() - st.st_mtime < 24 * 60 * 60:
+                                    continue   # legacy, unmarked directories get a full day's grace
+                            else:
+                                with prompt_owner(directory):
+                                    pass
+                            # Recheck the listed name; rmtree also performs descriptor-relative lstat/open/fstat checks.
+                            if not prompt_directory_matches(st, os.stat(entry.name, dir_fd=parent_fd, follow_symlinks=False)):
+                                raise OSError("staging directory changed before removal")
+                            shutil.rmtree(entry.name, dir_fd=parent_fd)
+                    except Exception as e:
+                        print(f"prompts: kept staging directory {path} ({e})", flush=True)
+    except FileNotFoundError:
+        pass   # the first build's output parent may not exist yet
+    except OSError as e:
+        print(f"prompts: staging cleanup skipped ({e})", flush=True)
+
+
 def make_prompts(a, incremental=False):
     """Generate in a fresh sibling directory; only complete outputs can replace the previous set."""
     from kit import env_on
+    sweep_prompts(a.out)
     key = None
     reason = "packaged or direct build"
     if incremental:
@@ -1106,7 +1224,7 @@ def make_prompts(a, incremental=False):
         pass
     out = a.out
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".prompts-", dir=os.path.dirname(os.path.abspath(out))) as temp:
+    with tempfile.TemporaryDirectory(prefix=".prompts-", dir=os.path.dirname(os.path.abspath(out))) as temp, prompt_owner(temp, create=True):
         a.out = os.path.join(temp, "new")
         try:
             generate(a)

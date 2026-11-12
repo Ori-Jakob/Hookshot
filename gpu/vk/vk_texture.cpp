@@ -36,6 +36,7 @@
 #include "vk_texture.h"
 #include "vk_menu.h"
 #include "vk_draw.h"
+#include "vk_programs.h"
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
@@ -1883,10 +1884,10 @@ bool texture_size_ok(VkImageType type, uint32_t w, uint32_t h, uint32_t z, uint3
     return w <= most && h <= most && z <= lim.maxImageDimension3D && layers <= lim.maxImageArrayLayers &&
            (samples <= 1 || samples == 2 || samples == 4 || samples == 8 || samples == 16);
 }
-/// (hookshot) One level of an image as the texture budget counts it (create): its texels, or for an ASTC image the GPU samples
-/// itself (Intel's) its blocks of bw x bh texels, which are what its 16 bytes a unit are. Counted as texels, those were 16 bytes a
-/// texel, 16 to 144 times their size: a UHD 770 counted 17608 MB of textures against an integrated GPU's 2560 MB budget while
-/// every allocation of the process was 4766 MB, so the budget's eviction ran at every frame (tests/test_native_astc_texture_count.py)
+/// One mip level in texels (bw = bh = 1), or whole blocks for a compressed image.
+/// Round each mip extent up separately: even a 1x1 BC/ASTC level occupies one block.
+/// (Counted as texels, an ASTC image the GPU samples itself was 16 bytes a texel, 16 to 144 times its size, and
+/// BC1/BC4 twice theirs: tests/test_native_astc_texture_count.py)
 uint64_t texture_level_units(uint32_t w, uint32_t h, uint32_t d, uint32_t bw, uint32_t bh) {
     w = std::max(1u, w), h = std::max(1u, h), d = std::max(1u, d), bw = std::max(1u, bw), bh = std::max(1u, bh);
     return (uint64_t)((w + bw - 1) / bw) * ((h + bh - 1) / bh) * d;
@@ -1943,11 +1944,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         static const char* dim_env = getenv("RX_VK_TEX_MAX_DIM");
         const uint32_t max_dim = dim_env ? (uint32_t)atoi(dim_env) : small_mips ? 1024 : 2048;
         static const uint64_t max_bytes = (uint64_t)(getenv("RX_VK_TEX_MAX_MB") ? atoi(getenv("RX_VK_TEX_MAX_MB")) : 1536) << 20;
-        const uint32_t texel = astc ? 4 : std::max(1, bpb / std::max(1, bw * bh));
+        const bool blocks = !astc && (is_bc(x.format) || is_astc(x.format));
+        const uint32_t texel = astc ? 4 : blocks ? bpb : std::max(1, bpb / std::max(1, bw * bh));
         auto bytes_at = [&](uint32_t skip) {
             uint64_t px = 0;
             for (uint32_t l = skip; l < x.levels; l++)
-                px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
+                px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l,
+                                          blocks ? (uint32_t)bw : 1u, blocks ? (uint32_t)bh : 1u);
             return px * x.layers * texel * std::max(1, d.samples);
         };
         // (decoded ASTC only by size: uncompressed maps may be read at exact texel coordinates, and the GPU may
@@ -2177,12 +2180,15 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                  x.levels, (int)x.format, d.format);
         return nullptr;
     }
-    // what it costs: the level chain's texels (an ASTC image the GPU samples itself: its blocks, texture_level_units)
-    const bool astc_blocks = !astc && is_astc(x.format);
+    // what it costs: whole blocks for native BC/ASTC and re-encoded BC3, texels for other images.
+    // Re-encoded BC3 has 4x4, 16-byte blocks, not the source ASTC's block dimensions.
+    const bool blocks = is_bc(x.format) || is_astc(x.format);
+    const uint32_t unit_w = x.bc ? 4u : blocks ? (uint32_t)bw : 1u;
+    const uint32_t unit_h = x.bc ? 4u : blocks ? (uint32_t)bh : 1u;
     uint64_t px = 0;
     for (uint32_t l = 0; l < x.levels; l++)
-        px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l, astc_blocks ? (uint32_t)bw : 1u, astc_blocks ? (uint32_t)bh : 1u);
-    const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
+        px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l, unit_w, unit_h);
+    const uint32_t texel = x.bc ? 16 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
     // MB held, and a budget of 4035 MB took 4300. RX_VK_COUNT_BY_ESTIMATE=1: the texels)
@@ -2630,6 +2636,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     {   // (an upload over 15 ms: what it was, 60 of them)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - up0).count();
         static int slow_logged;
+        if (ms > 15.0) programs_slow_upload(ms, tex->width, tex->height, tex->nvn_format);   // (RX_VK_LOG_PROGRAM_LIFE=1)
         if (ms > 15.0 && slow_logged++ < 60) {
             uint64_t part = 0;
             if (partial) for (const auto& r : dirty) part += r.second - r.first;
@@ -3016,7 +3023,20 @@ bool readback_begin() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     return vkBeginCommandBuffer(rb_cmd, &bi) == VK_SUCCESS;
 }
+/// (hookshot, RX_VK_FRAME_TRACE) The time spent in a read-back's submit and wait for the GPU (the write-backs before an
+/// eviction, a flush to guest memory), and in texture_frame as a whole: neither was in any of the trace's columns. An area
+/// change had frames of 344 and 528 ms with every column near zero, the replay inside the driver in this wait for 317 ms
+std::atomic<int64_t> st_readback_wait_ns{0}, st_texture_frame_ns{0};
+struct TraceTimer {
+    std::atomic<int64_t>& into;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~TraceTimer() {
+        into.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    }
+};
 bool readback_submit_wait() {
+    const TraceTimer timed{st_readback_wait_ns};
     VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the copies' writes, for the host)
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -3918,9 +3938,9 @@ void compact_step(uint64_t completed) {
         if (frame_no < compact.next_check) return;
         compact.next_check = frame_no + 120;
         static const uint64_t min_free = (uint64_t)(getenv("RX_VK_COMPACT_MB") ? std::max(1, atoi(getenv("RX_VK_COMPACT_MB"))) : 512) << 20;
-        uint64_t block_bytes = 0, free_bytes = 0;
-        if (!textures_pool_usage(&block_bytes, &free_bytes) ||
-            free_bytes < vram_compact::run_from(min_free, compact.pressed))
+        uint64_t block_bytes = 0, free_bytes = 0, kept = 0;   // (kept: the blocks made at the start, which no run gives back)
+        if (!textures_pool_usage(&block_bytes, &free_bytes, &kept) ||
+            vram_compact::returnable(block_bytes, free_bytes, kept) < vram_compact::run_from(min_free, compact.pressed))
             return;
         if (!image_compact_begin(64ull << 20, 12)) return;
         compact.runs++, compact.moved = compact.moved_bytes = compact.ignored = compact.passes = 0;
@@ -4053,7 +4073,11 @@ uint64_t preset_texture_budget(uint64_t preset_mb, bool preset_applies, bool vra
     return integrated ? std::min(b, own) : b;
 }
 
+int64_t texture_readback_wait_ns() { return st_readback_wait_ns.load(std::memory_order_relaxed); }
+int64_t texture_frame_ns() { return st_texture_frame_ns.load(std::memory_order_relaxed); }
+
 void texture_frame(uint64_t completed) {
+    const TraceTimer timed{st_texture_frame_ns};   // (hookshot: the frame trace's tex_frame_ms)
     upload_frame_report();
     frame_upload_ns.store(0, std::memory_order_relaxed);
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
@@ -4257,13 +4281,16 @@ void texture_frame(uint64_t completed) {
     uint64_t hold_to = 0;    // (and what the hold's own line asks for, when the reserve's lower line set evict_to)
     // (hookshot, RX_VK_COMPACT) compacted, only the textures' pool's free space comes off the count: vram_compact.h
     uint64_t reclaim = block_free;
+    bool kept_only = false;   // (the textures' pool is down to its blocks made at the start: the 97% rule, below)
     if (compact_on()) {
-        uint64_t pool_blocks = 0, pool_free = 0;
-        if (textures_pool_usage(&pool_blocks, &pool_free)) reclaim = vram_compact::reclaimable(block_free, pool_free);
+        uint64_t pool_blocks = 0, pool_free = 0, pool_kept = 0;
+        if (textures_pool_usage(&pool_blocks, &pool_free, &pool_kept)) reclaim = vram_compact::reclaimable(block_free, pool_free);
+        kept_only = vram_compact::kept_only(pool_blocks, pool_kept);
     }
     const uint64_t pressure = by_blocks ? used : used - std::min(used, reclaim);
     pool_pressed = known && pressure > allowed / 10 * 9;   // (the target pool given back meanwhile)
     compact.pressed = known && vram_compact::pressed(used, allowed);   // (hookshot, RX_VK_COMPACT: by the driver's own count)
+    const uint64_t size_budget = budget;   // (the budget as a size, before the rules that take an excess off it: rule_target)
     if (known && pressure > allowed / 10 * 9) {
         const uint64_t over = pressure - allowed / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
@@ -4295,15 +4322,24 @@ void texture_frame(uint64_t completed) {
     // not grow, and what this evicts frees space inside the blocks that the count keeps. Ten frames later it squeezed again: a
     // ratchet. On a 4 GB RX 5500M (3337 MB used of 3337, 1224 MB free in the blocks) a paused game, whose scene draws nothing,
     // lost 1700 MB of textures in seconds, made again on unpausing (the long wait), and the HUD's drawn textures went with them.
-    // RX_VK_SQUEEZE_ALWAYS=1: as before
+    // But only while the count is within the allowance: past it the driver pages VRAM out to system memory, whatever room the
+    // blocks hold (#2156: an RTX 5050 8 GB at 7602 MB used of 6982 allowed, 1649 MB free in the blocks, paged 4.5 GB and ran at
+    // 14-25 fps; v2.0.14, without this wait, squeezed there. Ported from Revens2's a4c7cb3). RX_VK_SQUEEZE_ALWAYS=1: as before
     static const bool squeeze_always = env_on("RX_VK_SQUEEZE_ALWAYS");
-    const bool room_in_blocks = !squeeze_always && block_free >= allowed / 8;
-    if (known && !by_blocks && used > allowed / 100 * 97 && !room_in_blocks) {
+    const bool room_in_blocks = !squeeze_always && used <= allowed && block_free >= allowed / 8;
+    // (nor while the textures' pool is down to its blocks made at the start, which VMA keeps: what this evicts would leave the
+    // count as it is, the same ratchet, past the allowance too: there no eviction can bring the count down (#2711).
+    // RX_VK_SQUEEZE_ALWAYS=1 squeezes there too)
+    if (known && !by_blocks && !(kept_only && !squeeze_always) && used > allowed / 100 * 97 && !room_in_blocks) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
         rule_budget = std::min(rule_budget, total_bytes > over ? total_bytes - over : 0);
     }
-    const uint64_t rule_to = vram_compact::rule_target(total_bytes, rule_budget);
+    // (hookshot) the 90% rule and the driver's limit let go of their excess, not of an eighth of the cache: vram_compact.h.
+    // RX_VK_EVICT_EXCESS=0: to 7/8 of their budget, as before
+    static const bool excess_only = !getenv("RX_VK_EVICT_EXCESS") || atoi(getenv("RX_VK_EVICT_EXCESS")) != 0;
+    const uint64_t rule_to = excess_only ? vram_compact::rule_target(total_bytes, size_budget, rule_budget)
+                                         : vram_compact::rule_target(total_bytes, rule_budget);
     // (hookshot, RX_VK_COMPACT: the driver's limit asks for more than the reserve does: a pass over the budget, to 7/8 of it, as
     // before. Rare once the reserve is set: its line is 17 points under the limit's and counts the textures' free space out, so
     // this takes more than that share of the allowance free in their pool. Otherwise the pass is the hold's, and what the
