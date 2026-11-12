@@ -29,9 +29,29 @@ def block(text, marker):
     return text[start:end]
 
 
+def blocks(text, marker):
+    found = []
+    start = 0
+    while True:
+        try:
+            start = text.index(marker, start)
+        except ValueError:
+            return found
+        end = text.index("{", start) + 1
+        depth = 1
+        while depth:
+            depth += (text[end] == "{") - (text[end] == "}")
+            end += 1
+        found.append(text[start:end])
+        start = end
+
+
 def check_source(tex):
     frame = block(tex, "void texture_frame(uint64_t completed)")
-    if "if (tex->last_value > completed) continue;" not in frame:
+    evict = next((b for b in blocks(frame, "for (auto& [last, tex] : order) {") if "evict.push_back({tex," in b), "")
+    if not evict:
+        raise SystemExit("texture_frame no longer has the loop that chooses the targets to destroy")
+    if "if (tex->last_value > completed) continue;" not in evict:
         raise SystemExit("an in-flight texture can be evicted: its image would be pooled while the GPU reads it")
     if "destroy_later(*tex);" not in frame:
         raise SystemExit("the eviction no longer pools an image the GPU is done with at once: the next frame makes a new one")

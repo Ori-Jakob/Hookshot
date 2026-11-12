@@ -8,9 +8,11 @@
 namespace mkwvk::target_overlap {
 
 /// The spans of a render target's storage [lo, hi), last used at frame `last_used`, that newer render targets have drawn
-/// over, merged: one from another start covers its share, one written before the last use covers nothing, and several that
-/// drew over parts of it are added up (together they cover as much as one over the whole span). The candidates come in
-/// start order (vk_texture.cpp's by_start).
+/// over, merged: one from another start covers its share, one written before the last use covers nothing, and the ones over
+/// its two ends are added up. With a view of a part of it excluded, every candidate over its start clips to `lo` and every
+/// one over its end to `hi`, so each side keeps only its longest: the sum differs from one over the whole span only when one
+/// newer target covers the head and another the tail (each under an eighth, together an eighth or more). The candidates
+/// come in start order (vk_texture.cpp's by_start).
 struct DrawnOver {
     uint64_t bytes = 0;   // (the spans closed so far)
     uint64_t start = 0, end = 0;   // (the one being grown)

@@ -1857,17 +1857,13 @@ void destroy_later(Texture& tex) {
     if (tex.pool_key && tex.allocation && tex.sparse_chunks.empty() && pool_cap()) {   // (a render target's: to the pool, its views too)
         d.pool_key = tex.pool_key, d.view_map = std::move(tex.views), d.bytes = tex.bytes + tex.pad;
         tex.views.clear();
-        d.memory = tex.sparse_chunks;
         pool_put(d);
-        for (const auto& attachment : tex.block_attachments)
-            dead.push_back(Dead{tex.last_value, attachment.image, attachment.allocation, {}, {}});
-        total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
-        return;
+    } else {
+        for (auto& kv : tex.views)
+            if (kv.second) d.views.push_back(kv.second);
+        d.memory = tex.sparse_chunks;
+        dead.push_back(std::move(d));
     }
-    for (auto& kv : tex.views)
-        if (kv.second) d.views.push_back(kv.second);
-    d.memory = tex.sparse_chunks;
-    dead.push_back(std::move(d));
     for (const auto& attachment : tex.block_attachments)
         dead.push_back(Dead{tex.last_value, attachment.image, attachment.allocation, {}, {}});
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
