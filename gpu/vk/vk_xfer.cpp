@@ -167,6 +167,28 @@ bool size_compatible(const Sub& a, const Sub& b) {
     return a.bpb == b.bpb && a.bw == b.bw && a.bh == b.bh;
 }
 
+/// 0: float or normalized, 1: unsigned integer, 2: signed integer (a blit may not mix them)
+int format_class(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2R10G10B10_UINT_PACK32:
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_A8B8G8R8_UINT_PACK32: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_B8G8R8_UINT:
+    case VK_FORMAT_R64_UINT: case VK_FORMAT_R64G64_UINT: case VK_FORMAT_R64G64B64_UINT: case VK_FORMAT_R64G64B64A64_UINT:
+        return 1;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_SINT: case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_SINT_PACK32: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_B8G8R8_SINT:
+    case VK_FORMAT_R64_SINT: case VK_FORMAT_R64G64_SINT: case VK_FORMAT_R64G64B64_SINT: case VK_FORMAT_R64G64B64A64_SINT:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
 } // namespace
 
 void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to_image) {
@@ -306,6 +328,21 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         VkImageCopy cp{layers(s), offset(s), layers(d), offset(d), extent(s)};
         vkCmdCopyImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     } else {   // scaled or converting: nearest, or linear when the game asked for it (colour only)
+        // (what Vulkan allows a blit: BLIT_SRC/BLIT_DST, one format class on both sides, the same format for depth or
+        // stencil, single-sampled images, and linear filtering only where the source format supports it; outside that
+        // the result is undefined, and some drivers write garbage or lose the device)
+        VkFormatProperties fs{}, fd{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, s.tex->format, &fs);
+        vkGetPhysicalDeviceFormatProperties(dev.physical, d.tex->format, &fd);
+        if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+            !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+            format_class(s.tex->format) != format_class(d.tex->format) ||
+            (!color && s.tex->format != d.tex->format) ||
+            s.tex->samples != VK_SAMPLE_COUNT_1_BIT || d.tex->samples != VK_SAMPLE_COUNT_1_BIT) {
+            warn(13, "texture blit the device cannot make: skipped");
+            full_barrier(cmd);
+            return;
+        }
         VkImageBlit bl{};
         bl.srcSubresource = layers(s);
         bl.dstSubresource = layers(d);
@@ -313,7 +350,9 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         bl.srcOffsets[1] = {s.x + (int32_t)s.w, s.y + (int32_t)s.h, s.z + (int32_t)s.d};
         bl.dstOffsets[0] = offset(d);
         bl.dstOffsets[1] = {d.x + (int32_t)d.w, d.y + (int32_t)d.h, d.z + (int32_t)d.d};
-        const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color;
+        const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color &&
+                            (fs.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+                            format_class(s.tex->format) == 0;
         vkCmdBlitImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
