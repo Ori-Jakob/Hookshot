@@ -47,8 +47,8 @@ class PromptSkipTests(unittest.TestCase):
         self.out = self.root / "game" / "prompts"
         self.out.parent.mkdir()
         self.source_files = [self.here / n for n in ("prompt_assets.py", "prompt_draw.py", "prompt_faces.py", "prompt_keys.py")]
-        self.game_files = [self.romfs / n for n in (P.FONT, P.prompt_keys.LABEL_FONT, "Pack/ZsDic.pack.zs", P.TEXTURES, P.LAYOUTS,
-                                                  "System/Resource/ResourceSizeTable.authored.rsizetable.zs")]
+        self.game_files = [self.romfs / n for n in (P.FONT, P.prompt_keys.LABEL_FONT, P.CETRA, "Pack/ZsDic.pack.zs", P.TEXTURES,
+                                                  P.LAYOUTS, "System/Resource/ResourceSizeTable.authored.rsizetable.zs")]
         self.kenney = self.root / "kenney_input"
         self.keyboard = self.root / "kenney_input_keyboard"
         self.font_files = [self.kenney / f["font"] for f in P.FACES.values()] + [self.keyboard / P.prompt_keys.FONT]
@@ -434,6 +434,12 @@ class PromptSkipTests(unittest.TestCase):
         self.game_files[1].write_bytes(b"bold font returns")
         self.build()
         self.assertEqual(self.calls, 4)
+        self.game_files[2].unlink()   # (the control guide's comma and plus come from the game's Cetra: guide_marks)
+        self.build()
+        self.assertEqual(self.calls, 5)
+        self.game_files[2].write_bytes(b"Cetra returns")
+        self.build()
+        self.assertEqual(self.calls, 6)
 
     def test_each_package_version_and_presence(self):
         self.build()

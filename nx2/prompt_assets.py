@@ -1087,6 +1087,10 @@ def prompt_key(a):
         fonts[prompt_keys.LABEL_FONT] = prompt_file(os.path.join(a.romfs, prompt_keys.LABEL_FONT))
     except FileNotFoundError:   # generate() uses Kenney's labels without the game's bold font
         fonts[prompt_keys.LABEL_FONT] = None
+    try:
+        fonts[CETRA] = prompt_file(os.path.join(a.romfs, CETRA))
+    except FileNotFoundError:   # generate() keeps spaces between the control guide's keys without it (guide_marks)
+        fonts[CETRA] = None
     for folder in (KENNEY, KENNEY_KEYBOARD):
         fonts[os.path.basename(folder)] = prompt_tree(folder, ".otf")
     game = {n: prompt_file(os.path.join(a.romfs, n)) for n in ("Pack/ZsDic.pack.zs", TEXTURES, LAYOUTS)}
