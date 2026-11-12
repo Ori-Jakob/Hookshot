@@ -34,7 +34,8 @@
 int hos_binding(int set, int button, int slot);   /* nn_hid.c */
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);   /* pad_sdl.c */
 void hos_sdl_pad_first_name(char *out, size_t cap);
-int hos_mods_find(const char *prefix, const char *suffix, char *out, size_t cap);   /* mods.c */
+int hos_mods_file(const char *rel, char *out, size_t cap);   /* mods.c */
+extern const char *hos_romfs_dir;   /* nn_fs.c: the game's RomFS folder */
 int hos_xinput_pads(void);   /* nn_hid.c */
 int rx_option(int id, int otherwise);   /* rx_backend.c: the Insert menu's rows */
 
@@ -1315,15 +1316,34 @@ static int layout_runs(const char *dir, int face, const int *bind, Layout *o) {
     return 1;
 }
 
+/* The game's table name, as nx2/prompt_assets.py selects it for the prompts. A mod can
+   include other versions' tables too; those must not seed the one-time merge. */
+static int game_table(char *out, size_t cap) {
+    char pattern[MAX_PATH], name[MAX_PATH] = "";
+    if (!hos_romfs_dir) return 0;
+    snprintf(pattern, sizeof pattern, "%s/System/Resource/ResourceSizeTable.*.rsizetable.zs", hos_romfs_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(pattern, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && (!name[0] || strcmp(fd.cFileName, name) < 0))
+            snprintf(name, sizeof name, "%s", fd.cFileName);
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+    if (!name[0]) return 0;
+    snprintf(out, cap, "System/Resource/%s", name);
+    return 1;
+}
+
 /* builds prompts/External.bfotf.zs for this run; 1 when there is one */
 static int build(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    /* (a mod's size table is served with ours merged in: sizes. One that cannot take ours is served as it is, and the font,
-       larger than the game's, would not fit it) */
-    char mod[MAX_PATH];
-    if (hos_mods_find(SIZES_PATH, ".rsizetable.zs", mod, sizeof mod) && sizes(dir, mod, path, sizeof path) < 0) {
+    /* A mod's size table is served with ours merged in. Check the same table even when the font
+       is opened first; an unmergeable one cannot hold the font, which is larger than the game's. */
+    char table[MAX_PATH], mod[MAX_PATH];
+    if (game_table(table, sizeof table) && hos_mods_file(table, mod, sizeof mod) && sizes(dir, mod, path, sizeof path) < 0) {
         hos_log("prompts: a mod's resource size table cannot take the prompts' sizes: the game's own icons in texts");
         return 0;
     }

@@ -1,8 +1,9 @@
 """scripts/team_chat.py, game-free and offline: against a stand-in Matrix homeserver on 127.0.0.1, single sign-on comes
-back to the one-time listener and the session is saved readable by the user only; the room is joined once; a post
-carries the robot prefix; a second post within the minimum interval and the same text twice are refused with exit
-code 3 (--force skips the interval, never the repeat); read prints the room oldest first; a revoked session asks for
-a new login; logout forgets the token.
+back to the one-time listener (keeping the token when the browser closes the tab first) and the session is saved
+readable by the user only; the room is joined once; a post carries the robot prefix once (also when the text starts
+with one); a second post within the minimum interval and the same text twice are refused with exit code 3 (--force
+skips the interval, never the repeat); read prints the room oldest first; a revoked session asks for a new login;
+logout forgets the token.
 
     python -I -B tests/test_team_chat.py
 """
@@ -149,6 +150,21 @@ def main():
 
             assert run(chat, "whoami")[1].strip() == "@alice:magicbean.dev"
 
+            # the browser may close the tab before the "Signed in" page is sent (WinError 10053 on Windows): the token
+            # that came in is kept, and the listener neither prints a traceback nor waits out its timeout
+            port, ready, got = [], threading.Event(), []
+            aborted = ConnectionAbortedError(10053, "An established connection was aborted")
+            with mock.patch.object(http.server.BaseHTTPRequestHandler, "end_headers", side_effect=aborted), \
+                    contextlib.redirect_stderr(io.StringIO()) as noise:
+                waiter = threading.Thread(target=lambda: got.append(chat.wait_for_login_token(port, ready, 5)))
+                waiter.start()
+                ready.wait(5)
+                with contextlib.suppress(OSError):
+                    urllib.request.urlopen("http://127.0.0.1:%d/?loginToken=abc" % port[0], timeout=5).read()
+                waiter.join(10)
+            assert got == ["abc"], (got, noise.getvalue())
+            assert "Traceback" not in noise.getvalue(), noise.getvalue()
+
             now = [1_000_000.0]
             with mock.patch.object(chat.time, "time", lambda: now[0]):
                 code, out, _ = run(chat, "post", "Claimed #123: walls missing on Intel Arc")
@@ -168,8 +184,8 @@ def main():
 
                 now[0] += 61 * 60
                 assert "would go out" in run(chat, "status")[1]
-                code, _, _ = run(chat, "post", "PR #124 merged")
-                assert code == 0 and len(home.messages) == 3
+                code, _, _ = run(chat, "post", "\N{ROBOT FACE} \N{ROBOT FACE}PR #124 merged")
+                assert code == 0 and home.messages[2] == "\N{ROBOT FACE} PR #124 merged", "one robot, however many sent"
 
                 saved = json.load(open(path, encoding="utf-8"))
                 saved["min_interval_minutes"] = 120

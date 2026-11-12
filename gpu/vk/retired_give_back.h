@@ -40,9 +40,27 @@ constexpr uint64_t settled(uint64_t used, uint64_t pending) { return used > pend
 
 /// The bytes to give back: none up to high percent of the budget (0: off), past it down to low percent.
 constexpr uint64_t want(uint64_t used, uint64_t budget, int high, int low) {
-    if (high <= 0 || used <= budget / 100 * (uint64_t)high) return 0;
+    if (high <= 0 || !budget || used <= budget / 100 * (uint64_t)high) return 0;
     const uint64_t target = budget / 100 * (uint64_t)low;
     return used > target ? used - target : 0;
+}
+
+/// The system-heap budget imports_give_back measures against:
+/// - Under 12 GB (16 GB PCs and the Steam Deck), the heap's own budget as before (#479), unless RX_VK_IMPORT_CAP_MB > 0.
+/// - At 12 GB and above (32 GB+ PCs, where imports_give_back was off), capped at kLiveBudgetCap (4500 MB) by default so
+///   idle unmirrored pools do not pile up in amdgpu's per-submit BO list and capture ranges over a multi-hour session.
+/// - RX_VK_IMPORT_CAP_MB=<MB> sets the cap in MB (> 0: capped on any budget; 0: off at >= 12 GB unless a watermark switch
+///   is set). Setting RX_VK_IMPORT_HIGH or RX_VK_IMPORT_LOW without RX_VK_IMPORT_CAP_MB uses the full system-heap budget.
+constexpr uint64_t kSmallBudget = 12ull << 30;
+constexpr uint64_t kLiveBudgetCap = 4500ull << 20;
+constexpr uint64_t live_budget(uint64_t budget, bool env_pct_set, int env_cap_mb = -1) {
+    if (env_cap_mb > 0) {
+        const uint64_t cap = (uint64_t)env_cap_mb << 20;
+        return budget < cap ? budget : cap;
+    }
+    if (env_pct_set || budget < kSmallBudget) return budget;
+    if (env_cap_mb == 0) return 0;
+    return budget < kLiveBudgetCap ? budget : kLiveBudgetCap;
 }
 
 } // namespace retired_give_back

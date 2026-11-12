@@ -244,6 +244,7 @@ int main(int argc, char **argv) {
     if (!strcmp(name, "script-background")) CHECK(strstr(last_log, "game window not in front"));
     if (front) CHECK(pad_merges > 0 && key_queries > 0 && mouse_queries > 0);
     CHECK(focus_queries > 0);
+    CHECK(oc_consumed_pads == 0);   /* hos_oc_wait stays 0: the ocarina note layer took no pad button */
     printf("PASS: actual scripted parse/merge/Npad route %s\n", name);
     free(memory);
     return 0;
