@@ -494,6 +494,32 @@ Staging staging(uint64_t n, uint64_t align = 256) {
     return {a.buffer, 0, a.mapped, a.allocation};
 }
 
+/* (hookshot) The staging arenas, made before the game's pools and textures are. Making one later, with ~2.5 GB of pools and
+   textures held, took 12-25 ms on the Steam Deck (an 8 MB one could take 116 ms: it is the allocator, not the size), and
+   every one of them stalled the replay thread. That was the stutter when turning the camera: the arena the last burst used
+   had gone stale and been given back, so the first upload of the next burst made another. On an empty device they are cheap.
+   RX_VK_STAGING_PREWARM=<n>: how many, 0: none. */
+}  // namespace (the prewarm is called from the replay's start: it has to link)
+void texture_staging_prewarm(int n) {
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        Arena a;
+        void* m = nullptr;
+        if (!create_buffer(kArena, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
+                           a.allocation, &m)) {
+            logf("vk: staging prewarm: only %d of %d arenas could be made", made, n);
+            return;
+        }
+        a.mapped = (uint8_t*)m;
+        a.size = kArena, a.used = 0, a.value = 0;
+        a.used_at = std::chrono::steady_clock::now();
+        arenas.push_back(a);
+        made++;
+    }
+    if (made) logf("vk: %d staging arenas of %llu MB made before the game's memory", made, (unsigned long long)(kArena >> 20));
+}
+
+namespace {
 // ---- the GPU ASTC decoder (Eden's) ----
 struct AstcPush {
     uint32_t block_dims[2], layer_stride, block_size, x_shift, block_height, block_height_mask, native_tiling;

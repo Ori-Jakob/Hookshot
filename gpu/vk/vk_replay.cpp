@@ -511,6 +511,9 @@ T payload(const uint8_t* a, uint32_t bytes) {
 }
 
 int64_t st_barriers, st_ub_updates, st_ub_overlays, st_submits;
+/* (hookshot) what makes a draw rebuild its descriptors: which NVN binding moved the state's generation. A draw's
+   descriptor set is rebuilt when bind_gen moved, and 0.9 of the draws rebuilt theirs (3.2 ms a frame). */
+int64_t st_bg_prog, st_bg_bufs, st_bg_ubo, st_bg_ssbo, st_bg_tex, st_bg_samp, st_bg_img;
 std::map<int32_t, int64_t> st_barrier_flags;   // (the game's nvnCommandBufferBarrier bits: how many of each combination, the frame log)
 std::mutex st_barrier_flags_mu;   // (a parallel replay's threads count their barriers too)
 // ---- events in replay order: the values the stream's signals and the CPU's set, for the GPU's waits on them. The
@@ -1065,7 +1068,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             const auto b = payload<nvn_p_bind_program>(a, avail);
             // (the same program bound again: its descriptors already stand)
             const bool same = b.prog && s.has_prog ? std::memcmp(&s.prog, b.prog, sizeof s.prog) == 0 : !b.prog && !s.has_prog;
-            if (!same) s.bind_gen++;
+            if (!same) s.bind_gen++, st_bg_prog++;
             if (b.prog) s.prog = *b.prog;
             s.has_prog = b.prog != nullptr && b.prog->nstage > 0;
             break;
@@ -1143,7 +1146,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 }
                 nvn_p_bind_buf& u = (b.ssbo ? s.ssbo : s.ubo)[b.stage][index];
                 if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, index, b.r[i].address, b.r[i].size)) {
-                    s.bind_gen++;
+                    s.bind_gen++, st_bg_bufs++;
                     if (b.ssbo) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u.stage = b.stage, u.index = index, u.addr = b.r[i].address, u.size = b.r[i].size;
@@ -1164,6 +1167,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 nvn_p_bind_buf& u = (h.op == NOP_BIND_UBO ? s.ubo : s.ssbo)[b.stage][b.index];
                 if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, b.index, b.addr, b.size)) {
                     s.bind_gen++;
+                    (h.op == NOP_BIND_UBO ? st_bg_ubo : st_bg_ssbo)++;
                     if (h.op == NOP_BIND_SSBO) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u = b;
@@ -1187,6 +1191,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             while (n < b.n && b.first + n < lim) n++;
             if (!handles_unchanged(to + b.first, b.h, n)) {   // (the same handles: the draw keeps its descriptors)
                 s.bind_gen++;
+                (h.op == NOP_BIND_TEX ? st_bg_tex : h.op == NOP_BIND_SAMP ? st_bg_samp : st_bg_img)++;
                 s.tex_gen[b.stage] = s.bind_gen;
             }
             for (int k = 0; k < n; k++) to[b.first + k] = b.h[k];
@@ -3119,6 +3124,15 @@ void log_frame_stats() {
             snprintf(libs, sizeof libs, "; %.2f library links tried (%.2f ms), %lld libraries the driver had and %lld cold in all; "
                      "%lld of the cold built by workers (%.0f ms)", (links - l_links) / 120.0, (link_ms - l_link_ms) / 120.0,
                      (long long)lib_hits, (long long)lib_cold, (long long)lib_built, lib_build_ms);
+        {
+            static int64_t p0, b0, u0, ss0, t0, sa0, i0;
+            logf("vk: a frame: %lld bind_gen moves: program %.1f, many-binds %.1f, ubo %.1f, ssbo %.1f, tex %.1f, samp %.1f, img %.1f",
+                 (long long)((st_bg_prog - p0) + (st_bg_bufs - b0) + (st_bg_ubo - u0) + (st_bg_ssbo - ss0) + (st_bg_tex - t0) +
+                             (st_bg_samp - sa0) + (st_bg_img - i0)),
+                 (st_bg_prog - p0) / 120.0, (st_bg_bufs - b0) / 120.0, (st_bg_ubo - u0) / 120.0, (st_bg_ssbo - ss0) / 120.0,
+                 (st_bg_tex - t0) / 120.0, (st_bg_samp - sa0) / 120.0, (st_bg_img - i0) / 120.0);
+            p0 = st_bg_prog, b0 = st_bg_bufs, u0 = st_bg_ubo, ss0 = st_bg_ssbo, t0 = st_bg_tex, sa0 = st_bg_samp, i0 = st_bg_img;
+        }
         logf("vk: a frame: %.0f draws kept their neighbour's descriptors (%.0f of them through other slots' registrations)",
              (draw_desc_reused() - l_reused) / 120.0, (draw_slotgen_saves() - l_saves) / 120.0);
         l_reused = draw_desc_reused(), l_saves = draw_slotgen_saves();
@@ -4966,6 +4980,11 @@ bool init_pools_make(const VkCommandPoolCreateInfo& pi) {
 bool replay_start() {
     menu_init();
     if (!memory_init() || !vma_init(instance_proc())) return false;
+    {   // (hookshot) the staging arenas on an empty device: see texture_staging_prewarm
+        extern void texture_staging_prewarm(int n);
+        static const int prewarm = getenv("RX_VK_STAGING_PREWARM") ? atoi(getenv("RX_VK_STAGING_PREWARM")) : 4;
+        if (prewarm > 0) texture_staging_prewarm(prewarm);
+    }
     VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo tsi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
