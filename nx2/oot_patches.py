@@ -55,6 +55,15 @@ TEXT_DECL = "extern volatile float hos_text_scale;\nextern void hos_oot_text_pan
 LIFE_BUILD_ID = "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348"
 LIFE_HEAD = "void f_804bd8c0(Ctx *__restrict A64_NOESC c) {\n"
 MOVE_HEAD = "void f_82c415e0(Ctx *__restrict A64_NOESC c) {\n"
+# The new-game opening (host/hos_main.c hos_oot_opening), this build's functions only. The request is still sent.
+# The two movies are not started, and the opening's skip query is answered yes.
+OPENING_REQUEST_HEAD = "void f_80d9a820(Ctx *__restrict A64_NOESC c) {\n"
+OPENING_TIMELINE_HEAD = "void f_83b5bfb0(Ctx *__restrict A64_NOESC c) {\n"
+OPENING_QUERY_HEAD = "void f_80de6cb0(Ctx *__restrict A64_NOESC c) {\n"
+OPENING_REQUEST = "    hos_oot_opening(c, 0);   /* (nx2/oot_patches.py: skip the new-game opening) */\n"
+OPENING_TIMELINE = "    if (hos_oot_opening(c, 1)) return;   /* (nx2/oot_patches.py: the opening's movies) */\n"
+OPENING_QUERY = "    if (hos_oot_opening(c, 2)) return;   /* (nx2/oot_patches.py: the opening's skip edge) */\n"
+OPENING_DECL = "extern int hos_oot_opening(Ctx *c, int mode);\n"
 MOVE_ANCHOR = ("if (((c->x[8] >> 1) & 1)) { goto L_82c41748; }\n")
 MOVE_MATRIX = "L_82c41778:;\n"
 WARP_HEAD = "void f_806d2530(Ctx *__restrict A64_NOESC c) {\n"
@@ -180,6 +189,27 @@ def patch_cct_speed(source):
 CAM_HEAD = "void f_80644c80(Ctx *__restrict A64_NOESC c) {\n"
 
 
+def patch_opening(source):
+    """The supported build's three functions (a request, the timeline start, the skip query). None when this file has
+    none of them. A file patched before is left as it is."""
+    heads = ((OPENING_REQUEST_HEAD, OPENING_REQUEST), (OPENING_TIMELINE_HEAD, OPENING_TIMELINE),
+             (OPENING_QUERY_HEAD, OPENING_QUERY))
+    found = 0
+    for head, line in heads:
+        start = source.find(head)
+        if start < 0:
+            continue
+        found += 1
+        if line not in source:
+            at = start + len(head)
+            source = source[:at] + line + source[at:]
+    if not found:
+        return None
+    if OPENING_DECL not in source:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\n' + OPENING_DECL, 1)
+    return source
+
+
 def patch_mouse_camera(source):
     start = source.find(CAM_HEAD)
     if start < 0:
@@ -292,6 +322,23 @@ def patch_glyph(source):
     return _hook_head(source, GLYPH_HEAD,
                       "    hos_prompts_glyph(c->x[1]);   /* (nx2/oot_patches.py: where the button prompts' font is) */\n",
                       "extern void hos_prompts_glyph(uint64_t slot);\n")
+
+
+ZSTD_HEAD = "void f_80115c80(Ctx *__restrict A64_NOESC c) {\n"
+ZSTD_CALL = "    if (hos_zstd_stream(c)) return;   /* (nx2/oot_patches.py: HOS_NATIVE_ZSTD, the host's libzstd) */\n"
+
+
+def patch_zstd_stream(source):
+    """f_80115c80, the game's zstd stream decode of one compressed chunk (x0 the stream object, x1 and x2 the chunk, x3 the
+    DDict or 0; its job loop f_80115bf0 calls it for each chunk read), returns at once when hos_zstd_stream did the call:
+    with HOS_NATIVE_ZSTD on, the host's libzstd decodes the stream (host/hos_zstd.c); off, the function runs as lifted"""
+    start = source.find(ZSTD_HEAD)
+    if start < 0:
+        return None
+    if ZSTD_CALL in source:   # (made before: a lift patched again)
+        return source
+    at = start + len(ZSTD_HEAD)
+    return (source[:at] + ZSTD_CALL + source[at:]).replace('#include "a64.h"\n', '#include "a64.h"\nint hos_zstd_stream(Ctx *c);\n', 1)
 
 
 TEXT_HEAD = "void f_80b1e140(Ctx *__restrict A64_NOESC c) {"
@@ -780,6 +827,12 @@ def patch_file(s, name, protect_hearts=False):
         out = glyph
         counts["glyph hook"] += 1
         lines.append("oot_patches: the glyphs' hook in " + name)
+    zs = patch_zstd_stream(out) if protect_hearts else None
+    if zs is not None:
+        if zs != out:
+            lines.append("oot_patches: the zstd stream decode's host hook in " + name)
+        out = zs
+        counts["zstd stream hook"] += 1
     layout = patch_text_layout(out) if protect_hearts else None
     if layout is not None:
         out = layout
@@ -828,6 +881,13 @@ def patch_file(s, name, protect_hearts=False):
         out = center
         counts["disable camera centering"] += 1
         lines.append("oot_patches: disable camera centering switch in " + name)
+    opening = patch_opening(out) if protect_hearts else None
+    if opening is not None:
+        n = opening.count(OPENING_REQUEST) + opening.count(OPENING_TIMELINE) + opening.count(OPENING_QUERY)
+        counts["opening skip"] += n
+        if opening != out:
+            lines.append("oot_patches: the opening skip at %d function(s) in %s" % (n, name))
+        out = opening
     speed = patch_cct_speed(out) if protect_hearts else None
     if speed is not None:
         if speed[0] != out:
@@ -896,6 +956,7 @@ def report(paths, counts, protect_hearts=False):
         done["mouse camera"] = 0
         done["disable camera centering"] = 0
         done["scene format"] = 0
+        done["zstd stream hook"] = 0
     total = collections.Counter()
     for c in counts:
         total.update(c)
@@ -919,6 +980,8 @@ def report(paths, counts, protect_hearts=False):
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
     if protect_hearts and speed_hooks != len(SPEED_PLACES):
         print("oot_patches: WARNING: the movement speed's places were found %d times, not %d" % (speed_hooks, len(SPEED_PLACES)))
+    if protect_hearts and total["opening skip"] != 3:
+        print("oot_patches: WARNING: the opening skip was found at %d of 3 functions" % total["opening skip"])
     if protect_hearts and camera_speed != len(CAMERA_SPEED_HEADS):
         print("oot_patches: WARNING: the camera's turn speed was found in %d of %d functions (the Camera speed row turns only "
               "those)" % (camera_speed, len(CAMERA_SPEED_HEADS)))

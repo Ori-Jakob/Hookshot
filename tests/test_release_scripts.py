@@ -153,6 +153,12 @@ elif p[:2] == ["releases", "assets"]:
     for r in s["releases"]:
         for a in r["assets"]:
             if a["id"] == int(p[2]):
+                # (FAKE race: the other run of the nightly replaced this file, under a new id, since it was listed)
+                if s.get("race", {}).get(a["name"]):
+                    s["race"][a["name"]] -= 1
+                    s["next_id"] += 1
+                    a["id"] = s["next_id"]
+                    fail(404, "Not Found")
                 sys.stdout.write(a["content"])
                 save()
                 sys.exit(0)
@@ -180,6 +186,10 @@ elif p == ["releases"] and method == "POST":
 elif len(p) == 2 and p[0] == "releases" and method == "PATCH":
     r = release(p[1])
     change = json.loads(data)
+    # (as GitHub does: a draft changed without its tag_name comes back with an "untagged-..." one. v2.2.0-rc.1's draft
+    # lost its tag so when its notes were written, and was then not found by its tag for the publish)
+    if r["draft"] and "tag_name" not in change:
+        r["tag_name"] = "untagged-%s" % p[1]
     r.update(change)
     if change.get("draft") is False and not r.get("published_at"):
         r["published_at"] = "now"
@@ -327,6 +337,22 @@ class ReleaseScripts(unittest.TestCase):
         self.assertIn("Which file do I download?", made["body"])
         check = self.run_script("release_files.sh", "check", "v2.1.0", "hookshot-linux.txt")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
+    def test_sums_replaced_between_listing_and_read_are_read_again(self):
+        # (CI, the nightly's two runs at once: the other platform's run replaced SHA256SUMS after this run listed it;
+        # the failed read counted as none there, and each run uploaded it again, over the other's read, five times)
+        self.given([], tags={"v2.1.0": COMMIT})
+        r = self.upload()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        state = self.state()
+        state.update(race={"SHA256SUMS": 2}, calls=[])
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+        check = self.run_script("release_files.sh", "check", "v2.1.0", "hookshot-linux.txt")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        r = self.run_script("release_files.sh", "finish", "v2.1.0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["race"], {"SHA256SUMS": 0})
+        self.assertFalse([c for c in self.state()["calls"] if any("name=SHA256SUMS" in a for a in c)])
 
     # the nightly (scripts/release_upload.sh nightly): main's history Z, A, B, the newest last
 

@@ -149,6 +149,13 @@ void jobs_wait(const std::atomic<bool>& flag) {
             }
     done_cv.wait(lk, [&] { return flag.load(std::memory_order_acquire); });
 }
+bool jobs_wait_for(const std::atomic<bool>& flag, double ms) {
+    if (flag.load(std::memory_order_acquire)) return true;
+    if (ms <= 0) return false;
+    std::unique_lock lk(mu);
+    return done_cv.wait_for(lk, std::chrono::duration<double, std::milli>(ms),
+                            [&] { return flag.load(std::memory_order_acquire); });
+}
 int jobs_pending() {
     return pending.load();
 }

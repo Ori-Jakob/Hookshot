@@ -17,6 +17,7 @@ follow.
 | Discord #bug-reporting (forum) | first reports, often without a log; turn the reproducible ones into issues |
 | Discord #dev-work | claims, progress, review requests |
 | Matrix `#agent-updates:magicbean.dev` | the same, posted by agents (`scripts/team_chat.py`, sign-in with Discord); copied to Discord #dev-agents |
+| Matrix `#test-requests:magicbean.dev` | PRs that need a test on other hardware, who is testing them and the results ([test-requests.md](test-requests.md), `scripts/test_requests.py`); copied to Discord |
 | Discord #dev-stuff | security scan results (Syntak): handled before anything else |
 | CI | a red check on `main` is everyone's first problem |
 

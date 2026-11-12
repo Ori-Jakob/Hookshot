@@ -38,6 +38,7 @@
 #include "vk_ui.h"
 #include "vk_menu_keys.h"   // (which gamepad buttons confirm and go back: those A and B are bound to)         // (how it looks: Dear ImGui, vk_imgui.h)
 #include "vk_dlss.h"
+#include "vk_framegen.h"   // (Frame generation by: who makes the frames now, framegen_maker)
 #include "vk_bug_report.h"   // (the Gameplay tab's Bug report: what it writes, and how)
 #include "../../host/hos_wide_size.h"   // (the widescreen picture's size, as host/hos_main.c works it out)
 #include "vk_fsr3.h"      // (the Upscaler row: whether AMD FSR 3.1 runs on this GPU)
@@ -47,8 +48,10 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
+#include "auto_settings.h"
 #include "menu_restart.h"
 #include "vk_menu_i18n.h"
+#include "display_modes.h"   // (the Aspect ratio and Output resolution rows: the screen's sizes and their shapes)
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "hookshot_env.h"
 #endif
@@ -306,82 +309,297 @@ const char* tx_percent(int v) {
     snprintf(b, sizeof b, "%d%%", v);
     return b;
 }
-/// The main screen's size, as host/hos_main.c takes its shape at the start (the Aspect ratio row): false where it
-/// is not known (Linux: the sizes are shown as the 16:9 outputs)
-bool screen_size(uint32_t* w, uint32_t* h) {
+/// The host's screen: the main one, whose shape host/hos_main.c gives a 16:9 Output resolution at the start with ultrawide=1
+/// (Windows: the primary's size; Linux: SDL's primary desktop, MkwVkHost.screen_size): false where it is not known
+bool host_screen_size(uint32_t* w, uint32_t* h) {
 #ifdef _WIN32
     const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     if (sw > 0 && sh > 0) return *w = (uint32_t)sw, *h = (uint32_t)sh, true;
 #endif
+    int hw = 0, hh = 0;
+    if (host && host->screen_size && host->screen_size(&hw, &hh) && hw > 0 && hh > 0)
+        return *w = (uint32_t)hw, *h = (uint32_t)hh, true;
     return false;
+}
+#ifdef _WIN32
+/// The monitor the game's window is on (the nearest), with its size; false before there is a window
+bool window_monitor(MONITORINFOEXW& mi) {
+    const HWND wnd = app_window();
+    mi = {};
+    mi.cbSize = sizeof mi;
+    return wnd && GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi) && mi.rcMonitor.right > mi.rcMonitor.left &&
+           mi.rcMonitor.bottom > mi.rcMonitor.top;
+}
+#endif
+/// The screen the Aspect ratio and Output resolution rows mark ("(monitor's)", "(native)"): the one the game's window is on,
+/// its size now (a desktop size changed while running is followed: outputs_follow_screen); the host's before there is a
+/// window, and on Linux. False where neither is known
+bool screen_size(uint32_t* w, uint32_t* h) {
+#ifdef _WIN32
+    MONITORINFOEXW mi;
+    if (window_monitor(mi))
+        return *w = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left), *h = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top), true;
+#endif
+    return host_screen_size(w, h);
+}
+/// That screen's display modes, each as Windows lists it (every refresh rate and depth: display_modes.h keeps each size once);
+/// the primary's before there is a window; none where they are not known (Linux)
+std::vector<display_modes::Size> screen_modes() {
+    std::vector<display_modes::Size> v;
+#ifdef _WIN32
+    MONITORINFOEXW mi;
+    const wchar_t* device = window_monitor(mi) ? mi.szDevice : nullptr;
+    DEVMODEW m{};
+    m.dmSize = sizeof m;
+    for (DWORD i = 0; EnumDisplaySettingsW(device, i, &m); i++) v.push_back({(uint32_t)m.dmPelsWidth, (uint32_t)m.dmPelsHeight});
+#endif
+    return v;
 }
 // The output the menu's sizes are shown for: the Output resolution row's (applied at the next start), so the rows below follow a change
 // at once; the Handheld profile runs the game's own (1536x864)
 struct Out {
     uint32_t w, h;
 };
-// The Output resolution's choices: the sizes offered (0 the game's own), then, last, a size of the player's own from
-// hookshot_options.ini (output_res=<width>x<height>, host/nn_applet.c hos_output_parse: the same rules) when it is none of them.
-// The ini keeps the size, not the choice's number: output_res=3840x2160
+namespace dm = display_modes;
+// The Output resolution's choices: 0 the game's own (2048x1152), then the sizes the main screen offers (display_modes.h: its
+// display modes and its own size, each side rounded down to 8, those the game accepts, with the common sizes of the shapes
+// they have, 1440p, 4K and 5K at 16:9 on a 1080p screen too, by width then height; HOS_DISPLAY_MODES=<w>x<h>,... for a run;
+// where they are not known, the sizes offered before: 1920x1080, 2560x1440, 3840x2160, 5120x1440, 5120x2880), then, last,
+// a size of the player's own from hookshot_options.ini (output_res=<width>x<height>, host/nn_applet.c hos_output_parse: the
+// same rules) when it is none of them. The ini keeps the size, not the choice's number: output_res=3840x2160
+constexpr Out kGameOutput{2048, 1152};
+// (the sizes offered before the screen's: output_res=0 to 5 as saved then, and where the screen's are not known, by width then
+// height. nx2/pipeline_share.py OUTPUTS mirrors it)
 constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}, {5120, 1440}, {5120, 2880}};
-constexpr int kCustomOutput = std::size(kOutputs), kLastOutput = kCustomOutput;
+Out outputs_screen{0, 0};   // (the window's screen's size the choices were read for: outputs_follow_screen)
+/// A screen's own size among the modes, and its shape at the most pixels a picture of another shape takes when the size itself
+/// is past what the game accepts: a 7680x2160 32:9 screen gets 6256x1760, so its shape is still offered
+void add_screen_size(std::vector<dm::Size>& modes, uint32_t sw, uint32_t sh) {
+    modes.push_back({sw, sh});
+    unsigned w = 0, h = 0;
+    if (sh && !hos_output_size_valid(sw & ~7u, sh & ~7u)) {
+        hos_wide_size(sh, hos_wide_clamp((double)sw / sh), hos_wide_max_px(), &w, &h);
+        if (dm::ratio_name({w, h}) == dm::ratio_name({sw, sh})) modes.push_back({w, h});
+    }
+}
+const std::vector<Out>& outputs() {
+    static const std::vector<Out> v = [] {
+        const char* e = getenv("HOS_DISPLAY_MODES");
+        std::vector<Out> o{kGameOutput};
+        std::vector<dm::Size> modes = e ? dm::parse_list(e) : screen_modes();
+        if (!e) {
+            uint32_t sw = 0, sh = 0, hw = 0, hh = 0;
+            const bool screen = screen_size(&sw, &sh), host_screen = host_screen_size(&hw, &hh);
+            // (no modes but a screen's size (Linux): the sizes offered before, with the screen's)
+            if (modes.empty() && (screen || host_screen))
+                for (int i = 1; i < (int)std::size(kOutputs); i++) modes.push_back({kOutputs[i].w, kOutputs[i].h});
+            if (screen) add_screen_size(modes, sw, sh), outputs_screen = {sw, sh};
+            if (host_screen) add_screen_size(modes, hw, hh);   // (the host's shape, which ultrawide=1 gives a 16:9 size)
+        }
+        for (dm::Size s : dm::with_common(dm::offered(modes)))
+            if (!(s.w == kGameOutput.w && s.h == kGameOutput.h)) o.push_back({s.w, s.h});
+        if (o.size() == 1) {
+            o.insert(o.end(), std::begin(kOutputs) + 1, std::end(kOutputs));
+            std::sort(o.begin() + 1, o.end(), [](Out a, Out b) { return a.w != b.w ? a.w < b.w : a.h < b.h; });
+        }
+        return o;
+    }();
+    return v;
+}
+int custom_index() { return (int)outputs().size(); }   // (the player's own size's choice: after the sizes offered)
 Out custom_output{0, 0};   // (the player's own size; 0 x 0: none)
-int output_choice(int v) { return v >= 0 && (v < kCustomOutput || (v == kCustomOutput && custom_output.w)) ? v : 0; }
+// (a screen's sizes found while running, the window moved to another monitor or its desktop size changed: after the player's
+// own, so the choices' numbers before them keep their sizes; outputs_follow_screen)
+std::vector<Out> output_extras;
+int last_choice() { return custom_index() + (int)output_extras.size(); }
+int output_choice(int v) {
+    const int c = custom_index();
+    return v >= 0 && (v < c || (v == c && custom_output.w) || (v > c && v <= last_choice())) ? v : 0;
+}
 Out output_at(int v) {
     v = output_choice(v);
-    return v == kCustomOutput ? custom_output : kOutputs[v];
+    const int c = custom_index();
+    return v < c ? outputs()[v] : v == c ? custom_output : output_extras[v - c - 1];
+}
+/// The choice of size w x h: one of the sizes offered (or found since), else the player's own from now on
+int output_choice_of(uint32_t w, uint32_t h) {
+    for (int i = 0; i < custom_index(); i++)
+        if (outputs()[i].w == w && outputs()[i].h == h) return i;
+    for (int i = 0; i < (int)output_extras.size(); i++)
+        if (output_extras[i].w == w && output_extras[i].h == h) return custom_index() + 1 + i;
+    custom_output = {w, h};
+    return custom_index();
 }
 /// output_res= (or HOS_OUTPUT_RES) to a choice: "<width>x<height>" (each side a multiple of 8, rounded down; at least 640 x 360,
 /// at most 5120 x 2880's pixels, 5:4 to 48:9), one of the sizes offered or the player's own (custom_output); the numbers saved
-/// before (0 to 5) as theirs; anything else the game's own (host/nn_applet.c hos_output_parse: the same rules)
+/// before (0 to 5: 2048x1152, 2560x1440, 3840x2160, 1920x1080, 5120x1440, 5120x2880) as those sizes; anything else the game's
+/// own (host/nn_applet.c hos_output_parse: the same rules)
 int parse_output(const char* text) {
     unsigned w = 0, h = 0;
     if (text && sscanf(text, "%u%*[xX]%u", &w, &h) == 2) {
         w &= ~7u, h &= ~7u;
         if (!hos_output_size_valid(w, h))
             return 0;
-        for (int i = 0; i < kCustomOutput; i++)
-            if (kOutputs[i].w == w && kOutputs[i].h == h) return i;
-        custom_output = {w, h};
-        return kCustomOutput;
+        return output_choice_of(w, h);
     }
     const int v = text ? atoi(text) : 0;
-    return v >= 0 && v < kCustomOutput ? v : 0;
+    return v >= 1 && v < (int)std::size(kOutputs) ? output_choice_of(kOutputs[v].w, kOutputs[v].h) : 0;
 }
-// (the choices from smallest to largest, by width then height: 1920x1080, 2048x1152, 2560x1440, 3840x2160, 5120x1440,
-// 5120x2880, and the player's own in its place)
+dm::Size size_of(Out o) { return {o.w, o.h}; }
+/// Every choice there is, in order (the player's own when there is one, then the sizes found while running)
+std::vector<int> output_ids() {
+    std::vector<int> v;
+    for (int i = 0; i <= last_choice(); i++)
+        if (output_choice(i) == i) v.push_back(i);
+    return v;
+}
+/// Their sizes, in the same order
+std::vector<dm::Size> output_sizes() {
+    std::vector<dm::Size> v;
+    for (int i : output_ids()) v.push_back(size_of(output_at(i)));
+    return v;
+}
+/// The shapes of the choices, narrowest first: made again only when the player's own size changes (the sizes offered are
+/// fixed once read), as the rows ask for them at every frame they are drawn
+const std::vector<dm::Shape>& output_shapes() {
+    static std::vector<dm::Shape> v;
+    static Out made_for{~0u, ~0u};
+    static size_t extras = ~size_t(0);
+    if (made_for.w != custom_output.w || made_for.h != custom_output.h || extras != output_extras.size())
+        v = dm::shapes(output_sizes()), made_for = custom_output, extras = output_extras.size();
+    return v;
+}
+/// The shape (a place in output_shapes) of choice v
+int output_shape_of(int v) { return dm::shape_index(output_shapes(), size_of(output_at(v))); }
+/// The monitor's shape: the main screen's (as host/hos_main.c takes it), when it is one of output_shapes; "" where the screen's
+/// size is not known (Linux) or its shape is not offered (a portrait screen): the row then has a Monitor's shape value of its own
+std::string monitor_shape() {
+    uint32_t sw = 0, sh = 0;
+    if (!screen_size(&sw, &sh)) return std::string();
+    const std::string name = dm::ratio_name({sw, sh});
+    for (const dm::Shape& s : output_shapes())
+        if (s.name == name) return name;
+    return std::string();
+}
+/// The Aspect ratio row's values: output_shapes' places, the monitor's own marked; where monitor_shape is not known, one more
+/// after them, Monitor's shape (ultrawide=1 with a 16:9 size, as host/hos_main.c takes the screen's shape), as on main
+int aspect_monitor_value() { return monitor_shape().empty() ? (int)output_shapes().size() : -1; }
+int aspect_last() { return std::max(0, (int)output_shapes().size() - 1 + (aspect_monitor_value() >= 0 ? 1 : 0)); }
+/// The shape the Aspect ratio row's value v names (Monitor's shape where the monitor's is not known: 16:9 sizes)
+std::string aspect_shape(int v) {
+    const std::vector<dm::Shape>& shapes = output_shapes();
+    if (shapes.empty() || v == aspect_monitor_value()) return std::string("16:9");
+    return shapes[std::clamp(v, 0, (int)shapes.size() - 1)].name;
+}
+/// The row's value for shape name (16:9's when it is not one of them)
+int aspect_index(const std::string& name) {
+    const std::vector<dm::Shape>& shapes = output_shapes();
+    for (int i = 0; i < (int)shapes.size(); i++)
+        if (shapes[i].name == name) return i;
+    for (int i = 0; i < (int)shapes.size(); i++)
+        if (shapes[i].name == "16:9") return i;
+    return 0;
+}
+/// Whether the row's value v is the monitor's shape: the window's screen's, marked "(monitor's)"
+bool aspect_is_monitors(int v) {
+    const std::string m = monitor_shape();
+    return m.empty() ? v == aspect_monitor_value() : aspect_shape(v) == m;
+}
+/// The host's screen's shape when it is one of output_shapes ("" otherwise): what ultrawide=1 gives a 16:9 size at the start
+std::string host_shape() {
+    uint32_t w = 0, h = 0;
+    if (!host_screen_size(&w, &h)) return std::string();
+    const std::string name = dm::ratio_name({w, h});
+    for (const dm::Shape& s : output_shapes())
+        if (s.name == name) return name;
+    return std::string();
+}
+/// Whether the row's value v is saved as ultrawide=1: the host's shape (a 16:9 size then takes it at the next start, as it
+/// shows), or Monitor's shape where the monitor's is not known. The same as the mark where the window is on the host's screen
+bool aspect_follows_host(int v) {
+    if (v == aspect_monitor_value()) return true;
+    const std::string h = host_shape();
+    return h.empty() ? aspect_is_monitors(v) : aspect_shape(v) == h;
+}
+/// The Aspect ratio row's value for Output resolution choice v: a size of a shape of its own is that shape; a 16:9 one is the
+/// monitor's shape when ultrawide (0 or 1, as host/hos_main.c started with it) follows the monitor, else 16:9
+int aspect_of_choice(int v, int ultrawide) {
+    const Out o = output_at(v);
+    if (hos_output_own_shape(o.w, o.h)) return aspect_index(dm::ratio_name(size_of(o)));
+    if (ultrawide != 1) return aspect_index("16:9");
+    const std::string h = host_shape(), m = monitor_shape();   // (the shape the host gives it: its screen's)
+    return !h.empty() ? aspect_index(h) : m.empty() ? aspect_monitor_value() : aspect_index(m);
+}
+/// The Aspect ratio row's value that choice v needs (the control bridge, before it walks the Output resolution to a size of
+/// another shape): its own shape; a 16:9 size, 16:9 itself, not the monitor's shape the row may be at
+int aspect_for_choice(int v) { return aspect_of_choice(v, 0); }
+/// The shape the Output resolution's arrows walk from choice id: its own; but a 16:9 size kept from before at the host's
+/// shape (ultrawide=1, the host widening it) walks into that shape's own sizes, the list the Aspect ratio row names
+std::string step_shape(int id) {
+    const std::string own = dm::ratio_name(size_of(output_at(id))), h = aspect_shape(opts.ultrawide);
+    return own == "16:9" && h != own && opts.ultrawide != aspect_monitor_value() && aspect_follows_host(opts.ultrawide) ? h : own;
+}
+Out picture_for(int v, bool* native);
+// (the choices of id's shape (step_shape), from smallest to largest by the size each shows (picture_for), width then height:
+// 1920x1080, 2048x1152, 2560x1440, 3840x2160 at 16:9, the player's own in its place; id itself among them. A 16:9 size walked
+// at the host's wider shape is where its picture is: the game's own 2048x1152 at a 5120x2160 screen's 21:9 draws 2728x1152,
+// between 2560x1080 and 3008x1264, not before them, and reached from either. What is saved is the choice, as before)
 int step_output_choice(int id, int dir) {
-    int order[kLastOutput + 1], n = 0;
-    for (int i = 0; i <= kLastOutput; i++)
-        if (output_choice(i) == i) order[n++] = i;
-    std::sort(order, order + n, [](int a, int b) {
-        const Out x = output_at(a), y = output_at(b);
-        return x.w != y.w ? x.w < y.w : x.h < y.h;
+    const std::string shape = step_shape(id);
+    std::vector<std::pair<Out, int>> order;
+    for (int i = 0; i <= last_choice(); i++) {
+        if (output_choice(i) != i) continue;
+        const Out shown = picture_for(i, nullptr);
+        // (the game's own is in the walk of the shape it is drawn at, as its row shows it)
+        if (i == output_choice(id) || dm::ratio_name(size_of(output_at(i))) == shape || (i == 0 && dm::ratio_name(size_of(shown)) == shape))
+            order.push_back({shown, i});
+    }
+    std::stable_sort(order.begin(), order.end(), [](const std::pair<Out, int>& a, const std::pair<Out, int>& b) {
+        return a.first.w != b.first.w ? a.first.w < b.first.w : a.first.h < b.first.h;
     });
-    const int at = (int)(std::find(order, order + n, output_choice(id)) - order);
-    return order[std::clamp(at + dir, 0, n - 1)];
+    int at = 0;
+    while (at < (int)order.size() && order[at].second != output_choice(id)) at++;
+    return order[std::clamp(at + dir, 0, (int)order.size() - 1)].second;
 }
-/// The picture an Output resolution choice makes: a custom surround output takes its own shape;
-/// otherwise the Aspect ratio at Monitor's shape takes the screen's. Both keep at most hos_wide_max_px() pixels, matching
-/// host/hos_main.c at startup (host/hos_wide_size.h); otherwise the
-/// 16:9 output. The game's own choice (0) as it is (its size comes from the game's graphics scale). *native: the screen's own size
+/// The Output resolution the Aspect ratio row's value v takes: the one the game started with at its shape; the one chosen when
+/// it has that shape; else the screen's own size when it has it; else the one whose height is nearest the screen's
+/// (display_modes.h pick)
+int aspect_started = -1;   // (the Aspect ratio row's value at the start, from the size the run started with: outputs_sync)
+int output_started = 0;    // (the Output resolution the run started with)
+int output_for_aspect(int v) {
+    // (back at the shape the game started with: the size it started with, so nothing is left to restart for. A first start on a
+    // 21:9 screen is 21:9 with the game's own size, which ultrawide=1 widens: stepping away and back took 5120x2160 (native))
+    if (v == aspect_started && output_choice(output_started) == output_started) return output_started;
+    const std::string name = aspect_shape(v);
+    if (dm::ratio_name(size_of(output_at(opts.output_res))) == name) return opts.output_res;
+    uint32_t sw = 0, sh = 0;
+    screen_size(&sw, &sh);
+    const int i = dm::pick(output_sizes(), name, {sw & ~7u, sh & ~7u});
+    return i < 0 ? opts.output_res : output_ids()[i];
+}
+/// The picture an Output resolution choice makes: a size not 16:9 (the Aspect ratio row's 21:9, 16:10, 4:3...) takes its own
+/// shape; a 16:9 one, at the monitor's own Aspect ratio, the screen's. Both keep at most hos_wide_max_px() pixels, matching
+/// host/hos_main.c at startup (host/hos_wide_size.h); otherwise the 16:9 output. The game's own choice (0) as the game draws it,
+/// its 2048x1152 widened the same way (2728x1152 at a 5120x2160 screen's 21:9). *native: the screen's own size
 Out picture_for(int v, bool* native = nullptr) {
     v = output_choice(v);
     Out o = output_at(v);
     uint32_t sw = 0, sh = 0;
     if (native) *native = false;
-    const bool surround = hos_output_is_surround(o.w, o.h);
-    if (v && !opts.handheld && (surround || opts.ultrawide)) {
-        const bool have_screen = screen_size(&sw, &sh);
-        const double want = surround ? (double)o.w / o.h : have_screen ? (double)sw / sh : 0.0;
+    const bool own = hos_output_own_shape(o.w, o.h);
+    screen_size(&sw, &sh);
+    uint32_t hw = 0, hh = 0;
+    const bool have_host = host_screen_size(&hw, &hh);
+    if (!opts.handheld && (own || aspect_follows_host(opts.ultrawide))) {
+        const double want = own ? (double)o.w / o.h : have_host ? (double)hw / hh : 0.0;   // (the host's screen: hos_main.c)
         const double game = 16.0 / 9.0;
         if (want > game * 1.01 || (want > 1.0 && want < game * 0.99)) {
             unsigned w = 0, h = 0;
             hos_wide_size(o.h, hos_wide_clamp(want), hos_wide_max_px(), &w, &h);
             o = Out{w, h};
         }
-        if (native) *native = o.w == sw && o.h == sh;
     }
+    if (native && v && !opts.handheld) *native = sw && o.w == (sw & ~7u) && o.h == (sh & ~7u);
     return o;
 }
 Out shown_output() {
@@ -474,6 +692,28 @@ const char* tx_output_res(int v) {
     snprintf(b, sizeof b, "%ux%u%s", o.w, o.h, native ? " (native)" : v ? "" : " (game's)");
     return b;
 }
+/// The Aspect ratio row (ultrawide=): the shapes of the sizes offered, narrowest first, the monitor's own named so
+const char* tx_ultrawide(int v) {
+    static char b[48];
+    if (v == aspect_monitor_value()) return "Monitor's shape";   // (the monitor's own not known: as on main)
+    // (printed from a format, so menu_i18n.h's "%s (monitor's)" translates it: vk_menu_i18n.cpp match_format)
+    if (aspect_is_monitors(v)) snprintf(b, sizeof b, "%s (monitor's)", aspect_shape(v).c_str());
+    else snprintf(b, sizeof b, "%s", aspect_shape(v).c_str());
+    return b;
+}
+/// The Aspect ratio: the monitor's own shape, the game's 16:9, or another shape, wider or narrower than 16:9
+const char* hn_ultrawide(int v, int variant) {
+    static const char* const t[] = {
+        "Your monitor's own shape: the picture fills it. The HUD keeps its 16:9 shape in the middle.",
+        "The game's own shape.",
+        "Wider than 16:9: the camera sees more at the sides. The HUD and menus keep the middle 16:9.",
+        "Narrower than 16:9: the picture keeps its height, and the HUD fills its width."};
+    if (variant >= 0) return variant < (int)std::size(t) ? t[variant] : nullptr;
+    if (aspect_is_monitors(v)) return t[0];
+    const std::vector<dm::Shape> shapes = output_shapes();
+    const double r = shapes.empty() ? 16.0 / 9.0 : shapes[std::clamp(v, 0, (int)shapes.size() - 1)].r, game = 16.0 / 9.0;
+    return r > game * 1.01 ? t[2] : r < game * 0.99 ? t[3] : t[1];
+}
 /// Anisotropic filtering: the game's own, or 2x to 16x (vk_draw.cpp aniso_override)
 const char* tx_anisotropy(int v) {
     static const char* t[] = {"Game's", "2x", "4x", "8x", "16x"};
@@ -491,7 +731,6 @@ const char* tx_text_size(int v) {
     return t[v];
 }
 const char* tx_fov(int v) { return v == 100 ? "100% (original)" : tx_percent(v); }
-const char* tx_ultrawide(int v) { return v ? "Monitor's shape" : "16:9"; }   // (the Aspect ratio row: a shape, not on or off)
 const char* tx_prompts(int v) {
     static const char* t[HOS_PROMPT_N + 1] = {"Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck",
                                               "Keyboard"};
@@ -597,13 +836,10 @@ const char* tx_robust(int v) {
     static const char* t[] = {"Auto", "Off", "On"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
-const char* tx_mesh_mode(int v) {
-    static const char* t[] = {"Automatic", "Native", "Compute"};
-    return (unsigned)v < 3 ? t[v] : t[0];
-}
 const char* tx_preset(int v) {
-    static const char* t[] = {"Custom", "Minimum (4GB)", "Low (6GB)", "Balanced (8GB)", "High (12GB)", "Ultra (16GB+)"};
-    return t[std::min(std::max(v, 0), 5)];
+    static const char* t[] = {"Custom", "Minimum (4GB)", "Low (6GB)", "Balanced (8GB)", "High (12GB)", "Ultra (16GB+)",
+                              "Auto (this PC)"};
+    return t[std::min(std::max(v, 0), 6)];
 }
 // (hookshot) The VRAM budget row's choices: the texture and mirror budgets in MB (0: Auto, the renderer's own rule). The presets'
 // budgets are among them (preset_vram_budget), so a preset sets the row, and the row can also be chosen on its own (null and
@@ -637,7 +873,21 @@ void sync_preset_budgets(int p) {
 // 3840 x 2160 window at that preset's picture, 2048 x 1152 or the handheld profile's 1536 x 864: same frame, mean |Laplacian|
 // of the window and of the picture, on the slider's steps)
 void env_release(const int* value);   // (below: a row the environment held, set by the menu from now on)
+// (hookshot) the Quality preset "Auto (this PC)", kAutoPreset: the profile menu_auto_for_gpu chose for this PC (auto_settings.h)
+::auto_settings::Choice auto_choice;   // (tier 0: no profile yet, before the card is known)
+uint64_t auto_for = 0;               // (the fingerprint of the hardware the options' Auto settings were chosen for: auto_for=)
+uint64_t auto_fp = 0;                // (this PC's, menu_auto_for_gpu)
+uint64_t auto_tuned = 0;             // (the fingerprint the measured tuning in play finished for: auto_tuned=)
+// (the Output resolution Auto set, by its size: auto_output=<w>x<h>. Another size there is the player's; 0 x 0: unknown. Not the
+// choice's number: the choices follow the screen's modes (#2566), and a new screen is when Auto chooses again)
+struct { uint32_t w = 0, h = 0; } auto_output;
+::auto_settings::Tuning auto_tuning;   // (the measured tuning in play, menu_auto_tune; its steps kept as auto_steps=)
+void apply_auto(bool keep_own);   // (below: the Auto preset's rows)
 void apply_preset(int p) {
+    if (p == kAutoPreset) {
+        apply_auto(false);   // (chosen on the row: all of its rows, as any preset)
+        return;
+    }
     // (the rows it sets are the preset's from now on, even at the value the environment forced: save writes them)
     if (p > 0)
         for (const int* v : {&opts.resolution, &opts.upscale, &opts.sharpness, &opts.pace, &opts.realtime, &opts.handheld})
@@ -672,13 +922,57 @@ void apply_preset(int p) {
     opts.budget = p;   // (Custom chosen on this row: no budget, as before)
     sync_preset_budgets(p);
 }
+/// keep_own (Auto choosing again for new hardware): the preset-exempt rows the player set under Auto stay theirs, the Output
+/// resolution (another than the one Auto set, auto_output) and the VRAM budget row (budget 0, set_row). Mesh shaders Auto never
+/// sets (RX_VK_MESH_SHADERS), and the fingerprint has the card's mesh shaders, not this run's mode
+void apply_auto(bool keep_own) {
+    const ::auto_settings::Choice& c = auto_choice;
+    if (c.tier < 1) return;
+    const Out set = output_at(opts.output_res);
+    const bool own_output = keep_own && auto_output.w && !(set.w == auto_output.w && set.h == auto_output.h);
+    const bool own_budget = keep_own && opts.preset == kAutoPreset && opts.budget == 0;
+    const int output = opts.output_res, vram_budget = opts.vram_budget;
+    env_release(&opts.dlss);
+    opts.dlss = c.upscaler;   // (before the tier's rows: apply_preset snaps its Render resolution to this upscaler)
+    apply_preset(c.tier);   // (the tier's scaling rows and memory budgets)
+    if (c.tier == 1) opts.upscale = 0, opts.sharpness = 0;   // (the plain scale, as RX_VK_LOW_SPEC: the lightest)
+    opts.handheld = 0;   // (docked: the handheld profile gave a GTX 1050 a black picture; the Render resolution lightens the card)
+    if (c.resolution) opts.resolution = ur::snap_render(c.upscaler, c.resolution);
+    if (own_output) {
+        opts.output_res = output;
+    } else {
+        env_release(&opts.output_res);
+        // (the size Auto chose, among the menu's choices: the screen's resolutions and the common ones; a size the menu does not
+        // offer is the game's own, never the player's custom size)
+        int at = 0;
+        const std::vector<Out>& offered = outputs();
+        for (int i = 1; c.output_w && i < (int)offered.size(); i++)
+            if ((int)offered[i].w == c.output_w && (int)offered[i].h == c.output_h) at = i;
+        if (c.output_w && !at)
+            logf("vk: Auto (this PC): the screen's %dx%d is not among the Output resolution's choices: 2048x1152", c.output_w, c.output_h);
+        opts.output_res = at;
+        const Out o = output_at(at);
+        auto_output.w = o.w, auto_output.h = o.h;
+    }
+    if (own_budget) {
+        opts.budget = 0;
+        opts.vram_budget = vram_budget;
+        vram_budget_sync();
+    }
+    auto_tuned = 0;   // (chosen again: measured again in play)
+    auto_tuning = {};
+    opts.preset = kAutoPreset;   // (apply_preset set the tier's number)
+    auto_for = auto_fp;          // (chosen for this PC, whether at a start or on the menu's row)
+}
 
 MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself comes back to Custom; the VRAM budget row keeps its value.",
            "Resolution 50% (with DLSS its nearest mode), Lanczos, Sharpness 30%, the Handheld Profile.",
            "Resolution 75% (with DLSS its nearest mode), Lanczos, Sharpness 30%, the Handheld Profile.",
            "Resolution 100% (with DLSS its nearest mode), Catmull-Rom, Sharpness 30%.",
            "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40%.",
-           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 50%.")
+           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 50%.",
+           "Chosen for this PC from its graphics card, video memory and screen, and chosen again when they change. The log's "
+           "\"Auto (this PC)\" line says why.")
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
@@ -694,11 +988,76 @@ const char* hn_framegen(int v, int variant) {
     return b[std::clamp(v, 2, 8)];
 }
 MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
-const char* tx_framegen_by(int v) { return v ? "Built-in" : "Auto"; }
-MENU_HINTS(hn_framegen_by, 0,
-           "NVIDIA DLSS Frame Generation where it runs (RTX 40 and newer, with the Upscaler's depth and motion), else the "
-           "built-in one.",
-           "The renderer's own: made from the finished picture alone.")
+/// (hookshot) Who made the made frames lately (vk_framegen.cpp framegen_maker), with Frame generation on; nullptr: none made.
+/// One name each, "<engine> FG", on the Frame generation by row and the FPS counter alike
+const char* framegen_maker_name() {
+    if (opts.framegen < 1) return nullptr;
+    switch (framegen_maker()) {
+    case FgMaker::Dlss: return "DLSS FG";
+    case FgMaker::Fsr3: return "FSR 3.1 FG";
+    case FgMaker::BuiltIn: return "Built-in FG";
+    default: return nullptr;
+    }
+}
+/// Frame generation by: at Auto, who makes the frames now, so a player sees whether DLSS Frame Generation runs
+const char* tx_framegen_by(int v) {
+    const char* who = v ? nullptr : framegen_maker_name();
+    if (!who) return v ? "Built-in FG" : "Auto";
+    static char b[40];
+    snprintf(b, sizeof b, "Auto: %s", who);
+    return b;
+}
+/// Why DLSS-G does not make the frames now (vk_dlss.h FgSkip, and the Auto multiplier's FG_SKIP_COUNT), the row's line after
+/// "Not DLSS FG now: ". most: its runtime's most made frames, for FG_SKIP_TOO_MANY
+const char* framegen_skip_text(int why, unsigned most) {
+    switch (why) {
+    case FG_SKIP_OFF: return "DLSS Frame Generation is turned off for this run (RX_VK_DLSS_FG=0).";
+    case FG_SKIP_DEVICE: return "NVIDIA DLSS does not run on this GPU.";
+    case FG_SKIP_START:
+        return "NVIDIA's runtime did not start DLSS Frame Generation: it needs an RTX 40 or newer, and nvngx_dlssg.dll in the "
+               "game's ngx folder (the builder's NVIDIA DLSS tick).";
+    case FG_SKIP_TOO_MANY: {
+        static char b[160];
+        snprintf(b, sizeof b, "Its runtime makes %u made frames at most: a lower Frame generation, or a newer nvngx_dlssg.dll.",
+                 most ? most : 1u);
+        return b;
+    }
+    case FG_SKIP_INPUTS:
+        return "No picture from a temporal Upscaler to make them from: NVIDIA DLSS or DLAA, or AMD FSR, on the Upscaler row. "
+               "The game's own menus have none.";
+    case FG_SKIP_REFUSED: return "NGX refused its frames.";
+    case FG_SKIP_NOT_BUILT: return "This build has no NVIDIA DLSS (the builder's NVIDIA DLSS tick).";
+    case FG_SKIP_COUNT: return "DLSS Frame Generation makes a fixed 2x to 8x, not Frame generation's Auto.";
+    default: return nullptr;
+    }
+}
+/// Its line: at Auto with another than DLSS-G making the frames, why ("Not DLSS FG now: " and framegen_skip_text). Variants
+/// (every one): Auto's, Built-in's, then "Not DLSS FG now: " with each reason
+const char* hn_framegen_by(int v, int variant) {
+    static const char* const t[] = {
+        "NVIDIA DLSS Frame Generation where it runs (RTX 40 and newer, with the Upscaler's depth and motion), else the "
+        "built-in one.",
+        "The renderer's own: made from the finished picture alone.",
+    };
+    if (v != 0) return variant <= 0 ? t[1] : nullptr;
+    static char b[FG_SKIP_COUNT + 2][400];
+    int why = FG_SKIP_NONE;
+    unsigned most = 0;
+    if (variant >= 0) {
+        if (variant == 0) return t[0];
+        why = variant;   // (1 .. FG_SKIP_COUNT: each reason, FG_SKIP_COUNT the Auto multiplier's)
+        if (why > FG_SKIP_COUNT) return nullptr;
+    } else {
+        const FgMaker m = opts.framegen >= 1 ? framegen_maker() : FgMaker::None;
+        if (m != FgMaker::BuiltIn && m != FgMaker::Fsr3) return t[0];
+        why = opts.framegen == 1 ? (int)FG_SKIP_COUNT : dlss_fg_skip(&most);
+    }
+    const char* text = framegen_skip_text(why, most);
+    if (!text) return t[0];
+    char* out = b[variant >= 0 ? variant : FG_SKIP_COUNT + 1];
+    snprintf(out, sizeof b[0], "Not DLSS FG now: %s", text);
+    return out;
+}
 const char* tx_vsync(int v) {
     static const char* const t[] = {"Auto", "On", "Off"};
     return t[std::clamp(v, 0, 2)];
@@ -721,13 +1080,26 @@ const char* hn_vsync(int v, int variant) {
     }
     return variant <= 0 ? t[std::clamp(v, 0, 2)] : nullptr;
 }
-MENU_HINTS(hn_output_res, 0, "The game's own size.",
-           "The sharpest on a 2560x1440 screen: nothing to scale to the window.",
-           "The sharpest on a 3840x2160 screen. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "The sharpest on a 1920x1080 screen: the HUD and text pixel for pixel, nothing to scale to the window.",
-           "The sharpest on a 5120x1440 ultrawide screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "The sharpest on a 5120x2880 (5K) screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "Your own size, from output_res= in hookshot_options.ini.")
+/// The Output resolution: the game's own, the player's own, or one of the screen's sizes as it compares with the screen (its
+/// own, larger, smaller; nothing where the screen's size is not known)
+const char* hn_output_res(int v, int variant) {
+    static const char* const t[] = {
+        "The game's own size.",
+        "Your screen's own size: the HUD and text pixel for pixel, nothing to scale to the window.",
+        "Larger than your screen: drawn bigger, then scaled down to the window. Sharper, and slower. The game's render "
+        "targets get a bigger GPU pool, so a full-size 3D fits.",
+        "Smaller than your screen: faster, and scaled up to the window.",
+        "Your own size, from output_res= in hookshot_options.ini."};
+    if (variant >= 0) return variant < (int)std::size(t) ? t[variant] : nullptr;
+    v = output_choice(v);
+    if (!v) return t[0];
+    if (v == custom_index()) return t[4];
+    uint32_t sw = 0, sh = 0;
+    if (!screen_size(&sw, &sh)) return nullptr;
+    bool native = false;
+    const Out o = picture_for(v, &native);
+    return native ? t[1] : (uint64_t)o.w * o.h > (uint64_t)sw * sh ? t[2] : t[3];
+}
 /// The Window scaling filter: its filter, or that none is needed at this window's size
 const char* hn_filter(int v, int variant) {
     static const char* const t[] = {"The plain copy.", "Sharper.", "Sharper still; can ring on edges."};
@@ -745,7 +1117,6 @@ const char* hn_sharpness(int v, int variant) {
 }
 MENU_HINTS(hn_handheld, 0, "As on a TV: the game at the Output resolution's size.",
            "As in the hands: the game at the console's handheld size (1536x864), lighter on the GPU.")
-MENU_HINTS(hn_ultrawide, 0, "The game's own shape.", "The camera takes the screen's shape, wider or narrower. The HUD keeps its 16:9 shape in the middle.")
 const char* tx_wide_menus(int v) {
     static const char* t[] = {"Full width", "Centred, blurred sides", "Centred, black bars"};
     return t[std::min(std::max(v, 0), 2)];
@@ -759,10 +1130,6 @@ const char* hn_astc_rgba8(int, int variant) {
                                        : nullptr;
 }
 MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
-MENU_HINTS(hn_mesh_mode, 0, "The GPU's own mesh shaders where it has them, the compute path where it has not (on Linux "
-           "AMD always the compute path: RADV's mesh shaders stop the GPU, issue 2245).",
-           "The GPU's own mesh shaders for every draw. A GPU without them still uses the compute path.",
-           "The compute path on every GPU: try it if your card crashes or leaves objects out. Usually a little slower.")
 MENU_HINTS(hn_fps, 0, nullptr, "The frame rate. With frame generation on, the game's own rate too.",
            "And the game's frame time, with its 1% low: the rate of its slowest 1% of frames over the last 10 seconds.",
            "And a graph of the last 4 seconds' frame times, with a line at the Game frame rate cap's.",
@@ -798,13 +1165,18 @@ Row rows[] = {
     // Graphics, in sections: a heading row is a section's title (draw_options draws it, the selection steps over it). The
     // Quality preset first, as it sets rows in every section. (Reflex, Anti-Lag 2, the Upscaler and the DLSS model only where
     // they run here; HDR's paper white and peak brightness only with HDR on: row_shown)
-    {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
+    {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 6, 1, tx_preset,
      "Sets the scaling rows and memory limits for a GPU with that much memory. The Upscaler and Frame generation stay yours.",
      hn_preset},
     // (the picture's way, top to bottom: the output's size, what fills it from the 3D, the 3D's size, its sharpening; then
     // the frames, and the window it is shown in)
     {TAB_GRAPHICS, "Resolution and upscaling", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
+    // (the shape, then its sizes: the screen's display modes, display_modes.h; outputs_sync sets both rows' ends at the start)
+    {TAB_GRAPHICS, "Aspect ratio", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
+     "The picture's shape: your monitor's own (the default: wider on an ultrawide, narrower on 4:3 or 16:10), the game's "
+     "16:9, or another your screen has. The Output resolution lists that shape's sizes. Applies after a restart.", hn_ultrawide,
+     true, true},
+    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, 0, 1, tx_output_res,
      "The game's whole frame, HUD included, before it is scaled to the window. Docked only. Applies after a restart.",
      hn_output_res, true, true},
     {TAB_GRAPHICS, "Profile", &opts.handheld, 0, 1, 1, tx_profile,
@@ -835,7 +1207,8 @@ Row rows[] = {
      "NVIDIA GPUs: each frame starts as late as it can, for less input delay. With frame generation too: it paces the "
      "game's frames.", hn_reflex, false, true},
     {TAB_GRAPHICS, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_antilag,
-     "AMD GPUs: each frame starts as late as it can, for less input delay. Not used with frame generation.", hn_antilag, false, true},
+     "AMD GPUs: each frame starts as late as it can, for less input delay. With frame generation too: it paces "
+     "the game's frames.", hn_antilag, false, true},
     {TAB_GRAPHICS, "Screen", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "Fills the whole screen with the game, without the window's border. The same as F11.", nullptr, false, true},
@@ -843,9 +1216,6 @@ Row rows[] = {
      "Whether a frame waits for the display's refresh before it is shown. Changes at once.", hn_vsync, false, true},
     {TAB_GRAPHICS, "Window scaling filter", &opts.upscale, 0, 2, 1, tx_filter,
      "How the finished picture is scaled to the window, when its size differs from the Output resolution.", hn_filter},
-    {TAB_GRAPHICS, "Aspect ratio", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
-     "The picture's shape: your monitor's (the default: wider on an ultrawide, narrower on 4:3 or 16:10), or the game's 16:9. "
-     "Applies after a restart.", hn_ultrawide, true, true},
     {TAB_GRAPHICS, "Ultrawide menus", &opts.wide_menus, 0, 2, 1, tx_wide_menus,
      "With the Aspect ratio at the monitor's shape: the pause, item and map menus, and what shows beside them. Loading "
      "screens and pre-rendered movies, which draw no world either, get the same sides. Changes at once.", hn_wide_menus, false, true},
@@ -878,9 +1248,8 @@ Row rows[] = {
     {TAB_GRAPHICS, "VRAM budget", &opts.vram_budget, 0, kVramBudgets - 1, 1, tx_vram_budget,
      "How much video memory the game's textures may use, and its copies of game memory with them. Lower it if the game "
      "stutters after a while of play; a preset sets it.", hn_vram_budget, false, true},
-    {TAB_GRAPHICS, "Mesh shaders", &opts.mesh_mode, 0, 2, 1, tx_mesh_mode,
-     "How the game's mesh programs (much of the scenery) run: on the GPU's own mesh shaders, or as compute shaders, which "
-     "every GPU has. Applies after a restart.", hn_mesh_mode, true, true},
+    // (no Mesh shaders row: changing it translated every shader again at the next start, for nothing a player gains. A launch
+    // switch now, RX_VK_MESH_SHADERS: gpu/vk/mesh_mode.h)
 
     // Audio
     {TAB_AUDIO, "Volume", &opts.volume, 0, 100, 5, tx_percent,
@@ -917,6 +1286,9 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Hookshot\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
      true},
+    {TAB_GAMEPLAY, "Skip opening", &opts.skip_opening, 0, 1, 1, tx_onoff,
+     "Skips the new-game opening (the story movie and Navi waking Link) and leaves later cutscenes, the Deku Tree "
+     "meeting, and the title screen alone.", nullptr, false, true},
 
     // Controls (12 rows; Motion opens the 6 TAB_MOTION rows, Controls its page with the 2 TAB_PAGE rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
@@ -939,7 +1311,8 @@ Row rows[] = {
      "How fast the right stick turns the camera, in percent of the game's own speed; the camera keys too, and the mouse "
      "with Mouse camera As the stick. The game's own camera speed setting still applies.", nullptr, false, true},
     {TAB_CONTROLS, "Stick dead zone", &opts.stick_dead_zone, 0, 5, 1, tx_stick_dead_zone,
-     "How far a stick moves before the game sees it, on each axis. Lower for a precise stick, higher for one that drifts. "
+     "How far a stick moves from center in any direction before the game sees it. "
+     "Lower for a precise stick, higher for one that drifts. "
      "The game's own dead zone still follows.", nullptr, false, true},
     {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 150, 25, tx_rumble,
      "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", nullptr, false, true},
@@ -1211,6 +1584,26 @@ const char* cheat_button_text(int i) {
 }
 constexpr int kRows = sizeof rows / sizeof rows[0];
 
+int ultrawide_read = 1;   // (ultrawide= as read: saved again while HOS_OUTPUT_RES holds the Output resolution and the row is as it was)
+/// (hookshot) The Aspect ratio and Output resolution rows' ends from the screen's sizes and the player's own (known once the
+/// options and HOS_OUTPUT_RES are read), and the Aspect ratio of the size chosen: a size of a shape of its own is that shape,
+/// a 16:9 one is the monitor's shape or 16:9, as ultrawide= says (menu_init, before restart_init: what the run starts with)
+void outputs_sync() {
+    const std::vector<dm::Shape> shapes = output_shapes();
+    for (Row& r : rows) {
+        if (r.value == &opts.output_res) r.hi = last_choice();
+        if (r.value == &opts.ultrawide) r.hi = aspect_last();
+    }
+    ultrawide_read = std::clamp(opts.ultrawide, 0, 1);
+    opts.ultrawide = aspect_started = aspect_of_choice(opts.output_res, ultrawide_read);
+    output_started = opts.output_res;
+    std::string list;
+    for (const dm::Shape& s : shapes) list += (list.empty() ? "" : ", ") + s.name;
+    logf("vk: the Output resolution's sizes: %d (%s, with the common sizes of their shapes, and the game's own)%s; shapes %s",
+         custom_index(), getenv("HOS_DISPLAY_MODES") ? "HOS_DISPLAY_MODES" : "the screen's modes",
+         custom_output.w ? ", and one of the player's own" : "", list.c_str());
+}
+
 int cur_tab = TAB_GRAPHICS;
 int tab_selected[TAB_COUNT + 1] = {};   // (and the Motion page's)
 bool is_motion_row(const Row& r) { return r.tab == TAB_CONTROLS && !r.value && !strcmp(r.name, "Motion"); }
@@ -1309,7 +1702,7 @@ int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
 bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov; }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
-bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov; }
+bool stops_at_ends(const Row& r) { return r.value == &opts.ultrawide || r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 150, the nearest 25)
 int rumble_step(int v) { return (std::min(std::max(v, 0), 150) + 12) / 25 * 25; }
 // (hookshot) A run's environment over a saved row (RX_VK_PACE=1, HOS_OUTPUT_RES=...): for that run only. save() writes the
@@ -1370,7 +1763,6 @@ const char* ini_key(const Row& r) {
     if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
     if (r.value == &opts.handheld) return "handheld_profile";   // (the Profile row; host/nn_applet.c reads it at the start)
     if (r.value == &opts.ultrawide) return "ultrawide";   // (the Aspect ratio row; host/hos_main.c reads it at the start)
-    if (r.value == &opts.mesh_mode) return "mesh_shaders";   // (gpu/vk/vk_main.cpp reads it as the device is made)
     static char k[32];
     size_t n = 0;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
@@ -1480,8 +1872,11 @@ void save() {
             const char* eq = strchr(line, '=');
             if (!eq || eq == line) continue;
             const std::string key(line, (size_t)(eq - line));
-            // (memory_budget too: save() writes it, and the file's old line, kept after it, won at the next start)
-            bool mine = key == "microphone_device" || key == "options_version" || key == "memory_budget";
+            // (memory_budget and auto_for too: save() writes them, and the file's old line, kept after it, won at the next start)
+            bool mine = key == "microphone_device" || key == "options_version" || key == "memory_budget" || key == "auto_for" ||
+                        key == "auto_tuned" || key == "auto_output" || key == "auto_steps";
+            // (and the Mesh shaders row's line, no longer read (gpu/vk/mesh_mode.h): dropped, not kept for nothing)
+            mine |= key == "mesh_shaders";
             for (const Row& r : rows)
                 if (!mine && r.value && key == ini_key(r)) mine = true;
             if (!mine) others += line, others += others.back() == '\n' ? "" : "\n";
@@ -1492,8 +1887,13 @@ void save() {
         for (const Row& r : rows) {
             if (r.value == &opts.output_res) {   // (the size itself: host/nn_applet.c reads it)
                 const int v = saved_value(r.value);
-                const Out o = v == kCustomOutput && player_custom_output.w && env_holds(r.value) ? player_custom_output : output_at(v);
+                const Out o = v == custom_index() && player_custom_output.w && env_holds(r.value) ? player_custom_output : output_at(v);
                 fprintf(f, "%s=%ux%u\n", ini_key(r), o.w, o.h);
+            } else if (r.value == &opts.ultrawide) {   // (the Aspect ratio: 1 the monitor's own shape, else 0; output_res holds the rest)
+                // (a run whose Output resolution HOS_OUTPUT_RES holds took the row from the environment's size: the player's own
+                // ultrawide= is kept, unless the row was changed in the menu)
+                const int v = saved_value(r.value);
+                fprintf(f, "%s=%d\n", ini_key(r), env_holds(&opts.output_res) && v == aspect_started ? ultrawide_read : aspect_follows_host(v) ? 1 : 0);
             } else if (r.value && r.value != &opts.game_lang) {   // (game_lang: language.txt's)
                 fprintf(f, "%s=%d\n", ini_key(r), saved_value(r.value));
             }
@@ -1502,6 +1902,12 @@ void save() {
         // (not a row: the budgets Custom keeps. 0 too: with a preset on, the VRAM budget row chosen by the player, which the next
         // start must not take back to the preset's)
         fprintf(f, "memory_budget=%d\n", opts.budget);
+        if (auto_for) fprintf(f, "auto_for=%016llx\n", (unsigned long long)auto_for);   // (the hardware Auto (this PC) chose for)
+        if (auto_tuned) fprintf(f, "auto_tuned=%016llx\n", (unsigned long long)auto_tuned);   // (and measured in play for)
+        if (auto_for && auto_output.w)   // (the Output resolution Auto set, by its size)
+            fprintf(f, "auto_output=%ux%u\n", (unsigned)auto_output.w, (unsigned)auto_output.h);
+        // (the tuning's steps so far and whether one went down: the no-seesaw rule and the two steps hold across restarts)
+        if (auto_for && auto_tuning.steps) fprintf(f, "auto_steps=%d,%d\n", auto_tuning.steps, auto_tuning.went_down ? 1 : 0);
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on; 5: the
         // Menu shortcut "Insert, F1 or Esc" by default, see menu_init; 6: the Aspect ratio's 16:9 from before moves on a
@@ -1812,12 +2218,12 @@ bool share_write(const std::string& path, const std::string& data) {
 }
 /// The template's values from this run: the version, the OS, the GPU and its driver, the output, the upscaler and the 3D's size,
 /// frame generation and HDR as the menu has them now, and the mods
-std::vector<std::string> share_values(long long pipelines, bool v2) {
+std::vector<std::string> share_values(long long pipelines, bool v2, long long computes) {
     std::vector<std::string> v(ps::kFieldCount);
     v[0] = HOOKSHOT_VERSION;
     v[1] = share_os() + "; " + dev.props.deviceName + ", driver " + driver_text();
     const Out o = shown_output();
-    v[2] = ps::output_text(o.w, o.h, opts.handheld != 0, output_choice(opts.output_res) == 0, opts.ultrawide != 0);
+    v[2] = ps::output_text(o.w, o.h, opts.handheld != 0, output_choice(opts.output_res) == 0, aspect_follows_host(opts.ultrawide));
     v[3] = std::string(tx_upscaler(opts.dlss)) + ", " + tx_resolution(opts.resolution);
     v[4] = std::string(tx_framegen(std::clamp(opts.framegen, 0, 8))) + " / " + tx_hdr(opts.hdr);
     std::vector<std::string> mods;
@@ -1828,7 +2234,7 @@ std::vector<std::string> share_values(long long pipelines, bool v2) {
                                             [](char x, char y) { return tolower((unsigned char)x) < tolower((unsigned char)y); });
     });
     v[5] = ps::mods_text(mods);
-    v[7] = ps::pipelines_text(pipelines, v2);
+    v[7] = ps::pipelines_text(pipelines, v2, computes);
     return v;
 }
 /// Save my pipeline list: the zip, then the clipboard, the folder and the issue (share_said says what happened)
@@ -1843,7 +2249,7 @@ void share_pipeline_list() {
         logf("menu: Save my pipeline list: %s", why.c_str());
         return;
     }
-    const std::string lines = ps::template_lines(share_values(n, !list.compare(0, 8, "HKSTATE2")));
+    const std::string lines = ps::template_lines(share_values(n, !list.compare(0, 8, "HKSTATE2"), ps::compute_count(list)));
     const time_t now = time(nullptr);
     tm t{};
 #ifdef _WIN32
@@ -1945,6 +2351,11 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         apply_preset(*r.value);
     } else {
         *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;   // (Game language: written when the row is left, game_lang_tick)
+        // (another shape: the Output resolution moves to one of its sizes, the screen's own when it has that shape)
+        if (r.value == &opts.ultrawide) {
+            const int out = output_for_aspect(*r.value);
+            if (out != opts.output_res) opts.output_res = out, env_release(&opts.output_res);
+        }
         // (another Upscaler: the Render resolution moves to the nearest of its steps, DLSS's modes or the game's)
         if (r.value == &opts.dlss) {   // (a slider stop kept)
             opts.resolution = ur::snap_render(upscaler(), opts.resolution);
@@ -2102,7 +2513,7 @@ std::atomic<bool> startup_on{false};
 std::atomic<float> startup_fade{0};   // (the start-up screen's fade to black at its end, 0 to 1: startup_fade_to)
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
 char fps_text[48] = "";
-char fps_sub[32] = "";
+char fps_sub[96] = "";   // (UTF-8: a translation's line can be three bytes a character)
 // (the FPS counter's levels past the number, written every half second by menu_tick: the frame time and its 1% low; the
 // Breakdown's parts, the GPU's time, the shaders built and draws left out over the graph's 4 s)
 char fps_ms_text[24] = "", fps_low_text[24] = "";
@@ -3659,6 +4070,17 @@ void menu_init() {
             if (!strcmp(line, "options_version")) version = atoi(eq + 1);
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
             if (!strcmp(line, "menu_size") && atoi(eq + 1) == 0) menu_auto = true;
+            if (!strcmp(line, "auto_for")) auto_for = strtoull(eq + 1, nullptr, 16);
+            if (!strcmp(line, "auto_tuned")) auto_tuned = strtoull(eq + 1, nullptr, 16);
+            if (!strcmp(line, "auto_output")) {   // (<w>x<h>; a number from before is unknown: 0 x 0)
+                unsigned w = 0, h = 0;
+                if (sscanf(eq + 1, "%ux%u", &w, &h) == 2) auto_output.w = w, auto_output.h = h;
+            }
+            if (!strcmp(line, "auto_steps")) {
+                int steps = 0, down = 0;
+                if (sscanf(eq + 1, "%d,%d", &steps, &down) == 2)
+                    auto_tuning.steps = std::max(steps, 0), auto_tuning.went_down = down != 0;
+            }
             if (!strcmp(line, "memory_budget")) opts.budget = std::min(std::max(atoi(eq + 1), 0), 5), has_memory_budget = true;
             has_vram_budget |= !strcmp(line, "vram_budget");
             if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
@@ -3706,6 +4128,7 @@ void menu_init() {
         opts.sharpness = 0;
     }
     if (opts.preset > 0 && !has_memory_budget) opts.budget = opts.preset;   // (a file from before memory_budget: its preset's)
+    if (opts.preset == kAutoPreset && !has_memory_budget) opts.budget = 0;   // (Auto: its tier's, menu_auto_for_gpu)
     if (!has_vram_budget) opts.vram_budget = preset_vram_budget(opts.budget);   // (a file from before the row)
     vram_budget_sync();
     fps_cap_started = opts.fps_cap;   // (the FPS counter's graph: the cap applies from the start, host/nn_vi.c)
@@ -3718,44 +4141,50 @@ void menu_init() {
             if (r.value == &opts.upscale) env_override(r.value, std::min(std::max(atoi(e), r.lo), r.hi));
     if (const char* e = getenv("HOS_REALTIME_STEP")) env_override(&opts.realtime, !env_value_off(e));
     if (const char* e = getenv("HOS_DYNRES")) env_override(&opts.resolution, env_value_off(e) ? 1 : 0);
+    if (const char* e = getenv("HOS_SKIP_OPENING")) env_override(&opts.skip_opening, !env_value_off(e));
     // (vk_texture.cpp reads RX_VK_ASTC_RGBA8 over the row: the row shows it, fixed (row_fixed), and the ini keeps the player's)
     if (const char* e = getenv("RX_VK_ASTC_RGBA8")) env_override(&opts.astc_rgba8, !env_value_off(e));
     if (const char* e = getenv("HOS_OUTPUT_RES")) {
         player_custom_output = custom_output;   // (parse_output replaces the player's own size with the environment's)
         env_override(&opts.output_res, parse_output(e));
     }
+    outputs_sync();   // (the Aspect ratio follows the size read)
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
 }
 
-/// (hookshot) The first start (no options file yet), once the card is chosen: the Quality preset for its memory, so an older or
-/// smaller card does not start at the docked 2048 x 1152 with the full-size memory budget. A GTX 1050 (4 GB) lost the device at
-/// the first scene that way (Discord 2026-11-10); the Minimum preset's handheld picture and budget are what such cards run.
-/// An integrated GPU or a card of up to 4.5 GB: Minimum, with the plain scale (as RX_VK_LOW_SPEC=1); up to 6.5 GB: Low; larger:
-/// the defaults, as before. Docked either way (the handheld profile gave a GTX 1050 a black picture). Options already saved are never changed. RX_VK_AUTO_PRESET=0: off
-void menu_first_start_for_gpu(const VkPhysicalDeviceProperties& props, const VkPhysicalDeviceMemoryProperties& mem) {
-    if (!first_start) return;
+/// (hookshot) The Quality preset "Auto (this PC)", once the card is chosen (vk_main.cpp pick_device): the profile auto_settings.h
+/// picks from the hardware. A first start (no options file yet) starts on it. With Auto on, the profile is applied when the
+/// hardware it was chosen for changes (another card, its memory, the screen's size, a build with or without DLSS or FSR 4):
+/// the fingerprint is kept in the options file (auto_for=). Changing a row yourself comes back to Custom, and then nothing here
+/// touches the settings; the rows no preset sets (the Output resolution, the VRAM budget) leave it on Auto, and
+/// what the player set on them is kept when Auto chooses again (apply_auto keep_own). Before Auto, a first start chose Minimum or Low by the card's memory alone: an older or smaller card no
+/// longer starts at the docked 2048 x 1152 with the full-size budget (a GTX 1050 lost the device at the first scene that way,
+/// Discord 2026-11-10). RX_VK_AUTO_PRESET=0: a first start keeps the defaults, as before Auto.
+/// RX_VK_AUTO_PRESET_VRAM_MB=<n>: the card's memory taken as n MB, to try the choice for a smaller or larger card
+void menu_auto_for_gpu(const VkPhysicalDeviceProperties& props, ::auto_settings::Hardware hw) {
+    const bool first = first_start;
     first_start = false;
-    if (!env_int("RX_VK_AUTO_PRESET", 1)) return;
-    if (env_on("RX_VK_LOW_SPEC")) return;   // (chosen already, menu_init)
-    uint64_t vram = 0;
-    for (uint32_t i = 0; i < mem.memoryHeapCount; i++)
-        if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram = std::max<uint64_t>(vram, mem.memoryHeaps[i].size);
-    const bool integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-    // (RX_VK_AUTO_PRESET_VRAM_MB=<n>: the card's memory taken as n MB, to try the choice on a larger card)
-    const uint64_t mb = getenv("RX_VK_AUTO_PRESET_VRAM_MB") ? (uint64_t)atoll(getenv("RX_VK_AUTO_PRESET_VRAM_MB")) : vram >> 20;
-    const int preset = integrated || mb <= 4608 ? 1 : mb <= 6656 ? 2 : 0;
-    if (!preset) return;
-    opts.preset = opts.budget = preset;
-    apply_preset(preset);
-    sync_preset_budgets(preset);
-    if (preset == 1) opts.upscale = 0, opts.sharpness = 0;
-    // (docked kept: the presets' handheld profile is what a player chooses; on the GTX 1050 above it gave a black picture.
-    // The Render resolution and the memory budget are what lighten the card)
-    opts.handheld = 0;
-    restart_init();   // (what this run starts with)
-    save();   // (host/nn_applet.c reads handheld_profile from the file when the game first asks its mode, after this)
-    logf("vk: first start on %s (%s, %llu MB of VRAM): the %s preset", props.deviceName, integrated ? "integrated" : "dedicated",
-         (unsigned long long)mb, tx_preset(preset));
+    if (const char* e = getenv("RX_VK_AUTO_PRESET_VRAM_MB")) hw.vram_mb = (uint32_t)atoll(e);
+    auto_choice = ::auto_settings::choose(hw);
+    const uint64_t fp = auto_fp = ::auto_settings::fingerprint(hw, props.vendorID, props.deviceID);
+    if (first && (!env_int("RX_VK_AUTO_PRESET", 1) || env_on("RX_VK_LOW_SPEC"))) return;   // (off, or chosen already: menu_init)
+    char hw_line[200];
+    snprintf(hw_line, sizeof hw_line, "%s, %u MB of video memory, %s, screen %dx%d at %d Hz, %u MB of RAM, %d threads",
+             props.deviceName, (unsigned)hw.vram_mb, hw.integrated ? "integrated" : "dedicated", hw.screen_w, hw.screen_h,
+             hw.refresh_hz, (unsigned)hw.ram_mb, hw.threads);
+    if (first) opts.preset = kAutoPreset;
+    if (opts.preset != kAutoPreset) {
+        logf("vk: Auto (this PC) would be: %s (%s)", auto_choice.why, hw_line);   // (for a bug report: what Auto would choose)
+        return;
+    }
+    if (fp == auto_for) {
+        logf("vk: Auto (this PC): the settings chosen for this PC before (%s)", hw_line);
+        return;
+    }
+    apply_auto(!first);   // (the hardware changed: the Output resolution and VRAM budget the player set stay theirs)
+    restart_init();   // (what this run starts with: the Output resolution applies at the next start, unless this is the first)
+    save();   // (host/nn_applet.c reads handheld_profile and output_res from the file when the game first asks its mode, after this)
+    logf("vk: Auto (this PC): %s: %s (%s)", first ? "first start" : "the hardware changed", auto_choice.why, hw_line);
 }
 
 int menu_vsync() { return env_on("RX_VK_FIFO") ? 1 : env_on("RX_VK_IMMEDIATE") ? 2 : opts.vsync; }
@@ -3937,6 +4366,71 @@ bool walk_to(State state, At at, Step step, int limit) {
     return false;
 }
 
+/// (hookshot) The Quality preset Auto (this PC)'s measured tuning in play (auto_settings.h tune): each of the replay's 120-present
+/// windows (vk_replay.cpp), the Render resolution one step lighter while frames are missed with the GPU over 90% of the cap's
+/// frame time, or one heavier while the cap holds with the GPU under 50%, up to the best mode that still upscales (never
+/// native); at most two steps (kept across restarts, auto_steps=), then done for this PC (auto_tuned=). The CPU holding the
+/// frame rate ends it for this run only. Not with Frame generation on (the frames shown are not the game's) nor with another
+/// preset. RX_VK_AUTO_TUNE=0: off. Before the tuning, in play (the upscaler has run, NGX has answered): the Render resolution for
+/// the upscaler that runs, when it is not the one Auto chose (auto_settings.h resolution_for)
+void menu_auto_tune(double gpu_ms, double draws, double fps) {
+    static const bool on = env_int("RX_VK_AUTO_TUNE", 1) != 0;
+    ::auto_settings::Tuning& tuning = auto_tuning;
+    std::lock_guard lk(menu_mu);
+    if (opts.preset != kAutoPreset || !auto_for) return;
+    if (draws >= 150) {
+        const ::auto_settings::Choice& c = auto_choice;
+        const int u = upscaler(), v = opts.resolution;
+        const int to = ::auto_settings::resolution_for(c, ur::engine(u), v, c.resolution ? ur::snap_render(c.upscaler, c.resolution) : 0);
+        if (to && ur::snap_render(u, to) != v) {
+            opts.resolution = ur::snap_render(u, to);
+            env_release(&opts.resolution);
+            samplers_changed();
+            menu_refresh = true;
+            tuning.n = 0;   // (the windows gathered were at the other share)
+            static const char* const name[ur::kUpscalers] = {"the game's own", "DLSS", "DLAA", "FSR 3.1", "FSR 4", "FSR 4", "Off"};
+            logf("vk: Auto (this PC): %s runs, not the %s chosen: Render resolution %d%% -> %d%%",
+                 name[std::clamp(u, 0, ur::kUpscalers - 1)], name[std::clamp(c.upscaler, 0, ur::kUpscalers - 1)], ur::percent(v),
+                 ur::percent(opts.resolution));
+            save();
+            return;
+        }
+    }
+    if (!on || auto_tuned == auto_for || opts.framegen || tuning.done) return;
+    // (the frame time the game runs to: the cap it started with, HOS_FPS_MAX over it, or the display's refresh with V-Sync On;
+    // as the FPS counter's line. Uncapped without V-Sync: the display's refresh, else 60)
+    const double target = fps_target_ms();
+    const int refresh = (display_refresh_mhz() + 500) / 1000;
+    const float cap = target > 0 ? (float)(1000.0 / target) : refresh > 0 ? (float)refresh : 60.0f;
+    const int u = upscaler(), v = opts.resolution;
+    if (ur::full_scale(u) || v == 0) return;   // (Native, or Auto's dynamic share: no steps to measure along)
+    // (heavier: up to the best mode that still upscales, past what the profile chose; never native: auto_settings.h best_step)
+    const int ceiling = ::auto_settings::best_step(u);
+    const int lighter = ur::step(u, v, 1), heavier = ur::step(u, v, -1);
+    const bool can_lighter = lighter != 0 && ur::percent(lighter) < ur::percent(v);
+    const bool can_heavier = heavier != 0 && ur::percent(heavier) > ur::percent(v) && ur::percent(heavier) <= ur::percent(ceiling);
+    const auto verdict = ::auto_settings::tune(tuning, (float)gpu_ms, (float)draws, (float)fps, cap, can_lighter, can_heavier);
+    if (verdict == ::auto_settings::WAIT) return;
+    if (verdict == ::auto_settings::LIGHTER || verdict == ::auto_settings::HEAVIER) {
+        opts.resolution = verdict == ::auto_settings::LIGHTER ? lighter : heavier;
+        env_release(&opts.resolution);
+        samplers_changed();   // (the upscalers' texture LOD bias follows the 3D's share, as when the row is set)
+        menu_refresh = true;
+        logf("vk: Auto (this PC), measured in play: %.0f fps of %.0f, the GPU at %.1f ms a frame of %.1f: Render resolution %d%% -> "
+             "%d%%", tuning.fps_mid, cap, tuning.gpu_mid, 1000.0 / cap, ur::percent(v), ur::percent(opts.resolution));
+    } else if (verdict == ::auto_settings::CPU_BOUND) {
+        // (this run only: early in play pipelines may still be compiling and textures streaming in; the next start measures again)
+        logf("vk: Auto (this PC), measured in play: the CPU holds the frame rate (%.0f fps of %.0f, the GPU at %.1f ms a frame of "
+             "%.1f): Render resolution %d%% kept for this run", tuning.fps_mid, cap, tuning.gpu_mid, 1000.0 / cap, ur::percent(v));
+        return;
+    } else {
+        auto_tuned = auto_for;
+        logf("vk: Auto (this PC), measured in play: settled (%.0f fps of %.0f, the GPU at %.1f ms a frame of %.1f): Render resolution "
+             "%d%% kept", tuning.fps_mid, cap, tuning.gpu_mid, 1000.0 / cap, ur::percent(v));
+    }
+    save();   // (after a step too: its steps, auto_steps=, so a restart before the next verdict keeps the no-seesaw rule)
+}
+
 /// The settings row whose ini key is key, set to value as the menu's Left and Right set it (set_row: cut to its range, the
 /// Quality preset made Custom unless the row is exempt, a restart noted, kept in the options file). The rows the arrows step
 /// through a list of their own (the Upscaler, Render resolution, the output resolution) are walked to value: walk_to. out: the
@@ -3951,6 +4445,13 @@ int menu_setting_set(const char* key, int value, MkwVkSetting* out) {
     Row& r = rows[i];
     if (row_fixed(r.value)) return bridge_fill(i, out), -1;
     const int want = std::min(std::max(value, r.lo), r.value == &opts.pad_layout ? std::min(r.hi, 2) : r.hi);   // (3: Custom, shown only)
+    if (r.value == &opts.output_res && output_choice(want) == want &&
+        dm::ratio_name(size_of(output_at(want))) != dm::ratio_name(size_of(output_at(opts.output_res)))) {
+        // (a size of another shape: the Aspect ratio moves to it first, as a player would, which takes the Output resolution
+        // into that shape's sizes; the walk below goes on from there)
+        for (Row& a : rows)
+            if (a.value == &opts.ultrawide) set_row(a, aspect_for_choice(want), 1, false);
+    }
     if (r.value == &opts.dlss || r.value == &opts.resolution || r.value == &opts.output_res) {
         // (the Render resolution's Native is a place of its own, DLAA or FSR 4's native AA, whatever the value it kept; the
         // Upscaler that runs, as set_row steps it: a saved DLAA that cannot run here is the game's own, and its values count)
@@ -4088,11 +4589,58 @@ void game_lang_tick() {
     }
 }
 
+/// (hookshot) The screen the window is on, followed while the game runs (every 30 presents): moved to another monitor, or its
+/// desktop size changed, the sizes it has that are not offered yet (its modes, its own size, the common sizes of their shapes)
+/// join the Output resolution's choices after the player's own, so the numbers chosen keep their sizes; the Aspect ratio row
+/// keeps the shape it is at (the list can gain one), and so do the run's start and the restart question's. HOS_DISPLAY_MODES:
+/// the list as given
+void outputs_follow_screen() {
+    static int every = 0;
+    if (++every % 30 || getenv("HOS_DISPLAY_MODES")) return;
+    uint32_t sw = 0, sh = 0;
+    if (!screen_size(&sw, &sh) || (sw == outputs_screen.w && sh == outputs_screen.h)) return;
+    outputs_screen = {sw, sh};
+    const int slot = [] {
+        for (const Row& r : rows)
+            if (r.value == &opts.ultrawide) return restart_slot_of(r);
+        return -1;
+    }();
+    // (the shapes the row's values name now: the same shapes after the list grows)
+    const bool at_monitor = opts.ultrawide == aspect_monitor_value();
+    const std::string now = aspect_shape(opts.ultrawide), started = aspect_shape(aspect_started),
+                      restart_from = slot >= 0 ? aspect_shape(restart_state.start[slot]) : std::string();
+    std::vector<dm::Size> modes = screen_modes();
+    add_screen_size(modes, sw, sh);
+    int added = 0;
+    for (dm::Size s : dm::with_common(dm::offered(modes))) {
+        const int before = last_choice();
+        if (s.w == kGameOutput.w && s.h == kGameOutput.h) continue;
+        const Out kept = custom_output;
+        const int at = output_choice_of(s.w, s.h);
+        custom_output = kept;   // (output_choice_of takes a size it does not have as the player's own: not this one)
+        if (at == custom_index() && !(kept.w == s.w && kept.h == s.h)) output_extras.push_back({s.w, s.h}), added++;
+        (void)before;
+    }
+    if (added) {
+        for (Row& r : rows) {
+            if (r.value == &opts.output_res) r.hi = last_choice();
+            if (r.value == &opts.ultrawide) r.hi = aspect_last();
+        }
+        opts.ultrawide = at_monitor && !monitor_shape().empty() ? aspect_index(monitor_shape()) : aspect_index(now);
+        aspect_started = aspect_index(started);
+        if (slot >= 0) restart_state.restart_value(slot, aspect_index(restart_from));
+        menu_refresh = true;
+    }
+    logf("vk: the window's screen is %ux%u (%s): %d sizes added to the Output resolution's", sw, sh,
+         dm::ratio_name({sw, sh}).c_str(), added);
+}
+
 void menu_tick() {
     std::lock_guard lk(menu_mu);   // (the control bridge's settings: menu_setting_set)
     share_finish();   // (Save my pipeline list's worker, done)
     fullscreen_tick();
     game_lang_tick();
+    outputs_follow_screen();
     enum { K_N = 17 };
     static bool held[K_N];
     static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
@@ -4545,8 +5093,13 @@ void menu_tick() {
         if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
             snprintf(fps_text, sizeof fps_text, "%.0f", shown);
             fps_rate_now = opts.framegen >= 1 ? game : shown;   // (the game's own against its cap, with frame generation too)
-            if (opts.framegen >= 1) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
+            // (the game's own rate, "Base", and who makes the frames: DLSS FG, FSR 3.1 FG or Built-in FG)
+            const char* who = framegen_maker_name();
+            if (opts.framegen >= 1 && who) snprintf(fps_sub, sizeof fps_sub, "Base %.0f, %s", game, who);
+            else if (opts.framegen >= 1) snprintf(fps_sub, sizeof fps_sub, "Base %.0f", game);
             else fps_sub[0] = 0;
+            // (in the menu's language: the counter draws with Tab, past ui::'s translation, so it is put in here)
+            if (const char* t = i18n::tr(fps_sub); t != fps_sub) snprintf(fps_sub, sizeof fps_sub, "%s", t);
         }
         static int64_t texts_next = 0;   // (the lines past the number: four times a second, each over the last half second)
         if (now >= texts_next) texts_next = now + fps_stats::kSecond / 4, fps_texts(now);

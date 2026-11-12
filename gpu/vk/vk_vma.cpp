@@ -14,6 +14,7 @@
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "hookshot_env.h"
 #endif
+#include "vram_compact.h"
 #include "vk_work.h"   // (last: RX_VK_RECORDER=defer drains before the destructions and the invalidate below)
 
 namespace mkwvk {
@@ -79,6 +80,27 @@ VmaPool target_images_pool() {
     return target_image_pool;
 }
 
+// (hookshot, RX 7800 XT: part of a pool's blocks made at the start, not when the game first needs them. Each is a vkAllocateMemory of
+// 128 MB, ~170 ms on AMD's driver, on the replay thread: ~70 of them in a walk across Hyrule Field, the frame rate dropping to the low
+// 40s whenever new ground came in. In the pool the sampled textures are made in and no other, 15% of the card's memory, 2 to 24 blocks:
+// vram_compact::blocks_at_start. RX_VK_IMAGE_PREALLOC=<blocks>: that many, 0: none)
+static size_t blocks_at_start(bool holds_textures) {
+    if (!holds_textures) return 0;
+    uint64_t heap = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max<uint64_t>(heap, dev.memory.memoryHeaps[h].size);
+    if (const char* e = getenv("RX_VK_IMAGE_PREALLOC")) return (size_t)std::max(0, atoi(e));
+    return (size_t)vram_compact::blocks_at_start(heap, kImageBlock, holds_textures);
+}
+/// The pool with n blocks made now, or empty when there is no room for them (its blocks made as needed); the blocks made
+static size_t make_pool(VmaPoolCreateInfo pi, size_t n, VmaPool& pool) {
+    pi.minBlockCount = n;
+    if (n && vmaCreatePool(vma, &pi, &pool) == VK_SUCCESS) return n;
+    pi.minBlockCount = 0;
+    if (vmaCreatePool(vma, &pi, &pool) != VK_SUCCESS) pool = VK_NULL_HANDLE;
+    return 0;
+}
+
 VmaPool images_pool() {
     if (image_pool_tried) return image_pool;
     image_pool_tried = true;
@@ -97,23 +119,9 @@ VmaPool images_pool() {
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
-    {   // (hookshot, RX 7800 XT: part of the blocks made now, at the start, not when the game first needs them. Each is a vkAllocateMemory of
-        // 128 MB, ~170 ms on AMD's driver, on the replay thread: ~70 of them in a walk across Hyrule Field, the frame rate dropping to the low
-        // 40s whenever new ground came in. 15% of the card's memory, 2 to 24 blocks; RX_VK_IMAGE_PREALLOC=<blocks>: that many, 0: none)
-        uint64_t heap = 0;
-        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
-            if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max<uint64_t>(heap, dev.memory.memoryHeaps[h].size);
-        uint64_t n = std::clamp<uint64_t>(heap / 100 * 15 / kImageBlock, 2, 24);
-        if (const char* e = getenv("RX_VK_IMAGE_PREALLOC")) n = (uint64_t)std::max(0, atoi(e));
-        pi.minBlockCount = (size_t)n;
-        if (n && vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) {   // (no room for them: as before, made as needed)
-            pi.minBlockCount = 0;
-            image_pool = VK_NULL_HANDLE;
-        }
-    }
-    if (!image_pool && vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
+    const size_t n = make_pool(pi, blocks_at_start(!vram_compact::enabled(getenv("RX_VK_COMPACT"))), image_pool);
     logf("vk: images from a pool of %llu MB blocks (memory type %u), %zu made at the start%s", (unsigned long long)(kImageBlock >> 20), type,
-         (size_t)pi.minBlockCount, image_pool ? "" : ": not made");
+         n, image_pool ? "" : ": not made");
     return image_pool;
 }
 
@@ -123,6 +131,7 @@ VmaPool images_pool() {
 // frame interpolation's and the scratch ones in the images' pool
 VmaPool texture_pool = VK_NULL_HANDLE;
 bool texture_pool_tried = false;
+uint64_t texture_pool_kept = 0;   // (its blocks made at the start, which VMA keeps: bytes)
 VmaPool textures_pool() {
     if (texture_pool_tried) return texture_pool;
     texture_pool_tried = true;
@@ -141,16 +150,17 @@ VmaPool textures_pool() {
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
-    if (vmaCreatePool(vma, &pi, &texture_pool) != VK_SUCCESS) texture_pool = VK_NULL_HANDLE;
-    logf("vk: textures from a pool of their own, %llu MB blocks (RX_VK_COMPACT)%s", (unsigned long long)(kImageBlock >> 20),
-         texture_pool ? "" : ": not made");
+    texture_pool_kept = make_pool(pi, blocks_at_start(true), texture_pool) * kImageBlock;
+    logf("vk: textures from a pool of their own, %llu MB blocks (RX_VK_COMPACT), %llu made at the start%s",
+         (unsigned long long)(kImageBlock >> 20), (unsigned long long)(texture_pool_kept / kImageBlock), texture_pool ? "" : ": not made");
     return texture_pool;
 }
-bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes) {
+bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes, uint64_t* kept_bytes) {
     if (!texture_pool) return false;
     VmaStatistics st{};
     vmaGetPoolStatistics(vma, texture_pool, &st);
     *block_bytes = st.blockBytes, *free_bytes = st.blockBytes - std::min(st.blockBytes, st.allocationBytes);
+    if (kept_bytes) *kept_bytes = texture_pool_kept;
     return true;
 }
 

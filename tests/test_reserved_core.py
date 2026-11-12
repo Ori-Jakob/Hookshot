@@ -4,6 +4,9 @@ On a CPU of one kind every core has the same EfficiencyClass and the last core i
 the efficiency cores come last and have the lower class, so the last performance core is kept instead. None is kept with
 fewer than 8 logical processors, nor on a CPU of more than one kind with fewer than 4 cores of the fastest kind.
 
+On Linux the classes come from /sys/devices/cpu_core/cpus, the performance cores' cpulist (parse_cpu_list), and
+hos_reserved_cpus asks last_fastest_core there before it falls back to the last core.
+
 python -I -B tests/test_reserved_core.py [--cxx clang++]
 """
 import argparse
@@ -33,6 +36,14 @@ def main():
     args = parser.parse_args()
     helper = block(args.source.read_text(encoding='utf-8'), 'static uint64_t pick_reserved_core(')
     helper += chr(10) + block(args.source.read_text(encoding='utf-8'), 'static uint64_t pick_cache_cores(')
+    helper += chr(10) + block(args.source.read_text(encoding='utf-8'), 'static uint64_t parse_cpu_list(')
+    source = args.source.read_text(encoding='utf-8')
+    reserved = block(source, 'uint64_t hos_reserved_cpus(void)')
+    linux = block(source, 'static uint64_t last_fastest_core(int *cores) {\n    *cores = 0;')
+    assert '#elif !defined(__EMSCRIPTEN__)' in reserved and reserved.index('last_fastest_core(&cores)', reserved.index('#elif')) > 0, \
+        'hos_reserved_cpus no longer asks last_fastest_core on Linux'
+    assert '/sys/devices/cpu_core/cpus' in linux and 'parse_cpu_list(' in linux and 'pick_reserved_core(' in linux, \
+        "Linux's last_fastest_core no longer reads the performance cores from /sys/devices/cpu_core/cpus"
     fixture = r'''
 #include <cstdint>
 #include <cstdio>
@@ -73,7 +84,21 @@ void add(Core* v, int* idx, int n, int per, int first, unsigned char cls) {
         (*idx)++;
     }
 }
+void classify(Core* v, int n, uint64_t fast) {   // (Linux: class 1 where the core is in cpu_core's list)
+    for (int i = 0; i < n; i++) v[i].cls = (v[i].mask & fast) != 0;
+}
 int main() {
+    {   // Linux cpulists
+        CHECK(parse_cpu_list("0-7\n") == 0xFF);
+        CHECK(parse_cpu_list("0-11,16-19") == 0xF0FFF);
+        CHECK(parse_cpu_list("3") == 0x8);
+        CHECK(parse_cpu_list("0,2,4-5\n") == 0x35);
+        CHECK(parse_cpu_list("60-70") == 0xF000000000000000ull);   // (past 63: left out)
+        CHECK(parse_cpu_list("") == 0);
+        CHECK(parse_cpu_list("x") == 0);
+        CHECK(parse_cpu_list("5-2") == 0);
+        CHECK(parse_cpu_list("1;2") == 0);
+    }
     {   // the cores that share the largest L3, when the CPU's L3s differ
         const uint64_t MB = 1 << 20;
         L3 l3_1[2] = {{0xFF, 96 * MB, 1}, {0xFF00, 32 * MB, 1}};
@@ -121,6 +146,12 @@ int main() {
     add(v, &idx, 2, 2, 0, 1); add(v, &idx, 4, 1, 4, 0); CHECK(pick(v, idx) == 0); idx = 0;         // i3-1215U
     add(v, &idx, 3, 2, 0, 1); add(v, &idx, 8, 1, 6, 0); CHECK(pick(v, idx) == 0); idx = 0;         // 3 fast cores
     CHECK(pick(nullptr, 0) == 0);                                       // empty
+    // Linux, classes from /sys/devices/cpu_core/cpus
+    add(v, &idx, 20, 1, 0, 0); classify(v, idx, parse_cpu_list("0-7\n")); CHECK(pick(v, idx) == 0x80); idx = 0;  // Core Ultra 7 265KF
+    add(v, &idx, 8, 2, 0, 0); add(v, &idx, 4, 1, 16, 0); classify(v, idx, parse_cpu_list("0-15\n"));
+    CHECK(pick(v, idx) == 0xC000); idx = 0;                                                                         // i7-12700K
+    add(v, &idx, 2, 2, 0, 0); add(v, &idx, 8, 1, 4, 0); classify(v, idx, parse_cpu_list("0-3\n"));
+    CHECK(pick(v, idx) == 0); idx = 0;                                                                              // i5-1235U
     add(v, &idx, 8, 2, 0, 0); v[idx].mask = 0; v[idx].cls = 1; idx++; CHECK(pick(v, idx) == 0xC000); // empty mask
     puts("PASS: the last core of the fastest kind with 4+ of them, the last core on CPUs of one kind, none under 8 "
           "logical processors");

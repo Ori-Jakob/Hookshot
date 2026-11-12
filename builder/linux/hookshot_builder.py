@@ -152,17 +152,22 @@ def game_ready(folder):
     return linux_update.game_exe(folder) is not None
 
 
+def read_cgroup(path):
+    """The unified control group, or "" when /proc is unavailable."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return next((line.rstrip("\n")[3:] for line in f if line.startswith("0::")), "")
+    except OSError:
+        return ""
+
+
 def own_scope(env, cgroup="/proc/self/cgroup", which=shutil.which, run=subprocess.run):
     """What goes before the game's command so that it outlives this window's systemd service, or [] when nothing has to.
     A desktop that starts each launcher as a service of its own (app-hookshot@<id>.service: COSMIC, GNOME, KDE) stops that
     service, and everything in its control group, when its main process ends; start_new_session leaves the session, not the
     control group, so Play then closing the window had systemd stop the game too, with SIGKILL 90 s later (#2529). In a scope
     of its own it stays. A terminal, a scope or no systemd: nothing to do, and the game starts as before"""
-    try:
-        with open(cgroup, encoding="utf-8") as f:
-            unit = next((line.rstrip("\n")[3:] for line in f if line.startswith("0::")), "")
-    except OSError:
-        return []
+    unit = read_cgroup(cgroup)
     if not unit.rpartition("/")[2].endswith(".service"):
         return []
     tool = which("systemd-run", path=env.get("PATH"))
@@ -178,6 +183,54 @@ def own_scope(env, cgroup="/proc/self/cgroup", which=shutil.which, run=subproces
     return scope if ok else []
 
 
+def wait_scope(process, proc_root="/proc", clock=time.monotonic, sleep=time.sleep, timeout=2):
+    """Wait only until the real runner leaves this service, not until its game ends."""
+    parent = read_cgroup(os.path.join(proc_root, "self", "cgroup"))
+    if not parent:
+        return False
+    deadline = clock() + timeout
+    while process.poll() is None:
+        child = read_cgroup(os.path.join(proc_root, str(process.pid), "cgroup"))
+        if child and child != parent and not child.startswith(parent + "/"):
+            return True
+        left = deadline - clock()
+        if left <= 0:
+            break
+        sleep(min(0.01, left))
+    return False
+
+
+def start_scoped(scope, command, options, wait=wait_scope):
+    """Start once: a runner that times out cannot later start a second game beside the plain fallback."""
+    process = None
+    try:
+        gate, go = socket.socketpair()
+        with gate, go:
+            # stdout is normally discarded. Use it as a gate until /proc proves the runner has escaped;
+            # the shell restores /dev/null before exec, leaving the diagnostics' stdin/stderr sockets alone.
+            script = 'IFS= read -r ready <&1 || exit 1\n[ "$ready" = go ] || exit 1\nexec >/dev/null\nexec "$@"'
+            process = subprocess.Popen(scope + ["/bin/sh", "-c", script, "hookshot-scope"] + command,
+                                       **dict(options, stdout=gate))
+            gate.close()
+            if wait(process):
+                go.sendall(b"go\n")
+                return True
+    except OSError:
+        pass
+    # No "go" was sent. Closing the gate above forbids a late exec, even if the move races this cancellation.
+    if process is not None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:   # (a stuck runner still cannot pass its closed gate)
+            pass
+    return False
+
+
 def play(folder):
     """the game, on its own (it outlives this window), from its folder. The launcher already asked about updates."""
     exe = linux_update.game_exe(folder)
@@ -190,15 +243,20 @@ def play(folder):
     scope = own_scope(env)   # (out of the launcher's systemd service, when it runs in one: #2529)
     try:
         with open(os.path.join(HERE, "play-diagnostics.sh"), encoding="utf-8") as script:
-            command = scope + ["/bin/sh", "-c", script.read(), "hookshot-play", exe]
+            command = ["/bin/sh", "-c", script.read(), "hookshot-play", exe]
         # (stderr a socket, not a pipe: the game takes a socket, as the journal's where a desktop launcher sends it, for nowhere to
         # log, and writes hookshot_log.txt; a pipe it takes for a reader and writes no log file (host/posix/win32_posix.c GetFileType).
         # The script reads the other end: what the game prints before its log opens)
         reading, writing = socket.socketpair()
         with reading, writing:
-            subprocess.Popen(command, **dict(options, stdin=reading, stderr=writing))
+            launch_options = dict(options, stdin=reading, stderr=writing)
+            if not scope or not start_scoped(scope, command, launch_options):
+                if scope:
+                    command.append("Hookshot: systemd scope hand-off failed; started without a separate scope.")
+                subprocess.Popen(command, **launch_options)
     except OSError:
-        subprocess.Popen(scope + [exe], **options)
+        if not scope or not start_scoped(scope, [exe], options):
+            subprocess.Popen([exe], **options)
 
 
 def share_pipeline_list(folder, out_dir=None, copy=None, open_path=None):
