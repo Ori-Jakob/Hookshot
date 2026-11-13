@@ -18,9 +18,16 @@ option.sav            (the game's own settings)
 slot_00/ ... slot_NN/ (one per save slot)
   progress.sav
   caption.sav
+  item_buttons.ini    (Hookshot's, when that save has items on its item buttons)
 ```
 
 Only the folder they are in differs.
+
+`item_buttons.ini` is Hookshot's own: the items that save has on A, B, X and Y with **Item assignable buttons**
+([Controls](../readme.md#controls)). Hookshot writes it when the game saves into that slot, and removes it when the save
+has none. The game never reads it and never lists a slot's folder, so it ignores the file, here, in the emulators and on
+a console. The script below copies whole slot folders, so the file goes with its slot both ways (an import replaces
+Hookshot's slot folders, their files with them; the backup keeps them).
 
 ## Where the saves are
 
@@ -98,7 +105,8 @@ copied to `oot-save-backups/<import or export>-<name>-<date>-<time>/` first: in 
 
 Close both programs, then copy the **contents** of the folder you are leaving into the folder you are going to (see
 the table above). Keep a copy of the target first. Delete the target's old `slot_*` folders before copying, so a slot
-that only exists on that side does not stay mixed in with the new save.
+that only exists on that side does not stay mixed in with the new save. A slot's `item_buttons.ini` goes with its
+folder, and goes away with the folders you delete.
 
 ## Before you copy
 

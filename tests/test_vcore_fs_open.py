@@ -8,7 +8,9 @@ that record whether the thread holds its core in host_path and in CreateFileA, t
 - host_path and CreateFileA run without the core, and the core is held again when OpenFile returns: a file opened, an
   unknown mount, a write to a mount that is not writable, a movie left out (HOS_NO_MOVIES), a blanked icon, a file not
   found;
-- a thread that holds no core when it calls OpenFile takes none.
+- a thread that holds no core when it calls OpenFile takes none;
+- the item buttons are told of each file opened (its guest path, whether for writing: host/oot_item_buttons.c, a save
+  slot's file is a load or a save of it), once, after the core is back, and of none that did not open.
 
 python -I -B tests/test_vcore_fs_open.py [--cxx clang++]
 """
@@ -91,7 +93,15 @@ static HANDLE CreateFileA(const char *p, DWORD a, DWORD s, void *sa, DWORD d, DW
     return create_ok ? (HANDLE)(intptr_t)0x1234 : INVALID_HANDLE_VALUE;
 }
 typedef struct { HANDLE h; int writable; char path[HOS_FS_PATH]; } Handle;
-static uint64_t new_handle(Handle *h) { free(h); return 7; }
+static Handle *last_handle;   /* (kept as the real table keeps it: OpenFile reads it after) */
+static uint64_t new_handle(Handle *h) { free(last_handle); last_handle = h; return 7; }
+/* the item buttons' look at each file opened (host/oot_item_buttons.c, which gives its core up for its own file calls) */
+static int told, told_write, held_told;
+static char told_path[64];
+void hos_oot_ib_save_file(const char *guest, int write) {
+    told++, told_write = write, held_told = held;
+    snprintf(told_path, sizeof told_path, "%s", guest);
+}
 
 @OPEN@
 
@@ -103,7 +113,7 @@ static uint64_t open_file(const char *path, int mode, int core) {
     Ctx c;
     memset(&c, 0, sizeof c);
     c.x[0] = (uint64_t)(uintptr_t)&handle, c.x[1] = (uint64_t)(uintptr_t)path, c.x[2] = (uint64_t)mode;
-    held = core, takes = 0, held_in_path = held_in_create = -1;
+    held = core, takes = 0, held_in_path = held_in_create = -1, told = 0, told_path[0] = 0;
     imp__ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci(&c);
     return c.x[0];
 }
@@ -123,6 +133,13 @@ int main(void) {
     check(held_in_path == 0, "host_path (where a prompt file is built at its first open) runs without the core");
     check(held_in_create == 0, "CreateFileA runs without the core");
     check(held == 1 && takes == 1, "the core is held again after OpenFile, taken once");
+    check(told == 1 && !told_write && held_told == 1 && !strcmp(told_path, "rom:/UI/LayoutArchive/Common.bntx.zs"),
+          "the item buttons are not told of the file opened, once, by its guest path, after the core is back");
+    path_writable = 1;
+    r = open_file("save:/slot_03/progress.sav", 6, 1);
+    check(r == 0 && told == 1 && told_write == 1 && !strcmp(told_path, "save:/slot_03/progress.sav") && held == 1,
+          "the item buttons are not told of a file opened for writing");
+    path_writable = 0;
 
     path_ok = 0;
     r = open_file("nomount:/x", 1, 1);
@@ -145,6 +162,7 @@ int main(void) {
     create_ok = 0;
     r = open_file("rom:/missing.bin", 1, 1);
     check(r == R_PATH_NOT_FOUND && held_in_create == 0 && held == 1, "a file not found: the core back");
+    check(told == 0, "the item buttons are told of a file that did not open");
     create_ok = 1;
 
     r = open_file("rom:/a.bin", 1, 0);

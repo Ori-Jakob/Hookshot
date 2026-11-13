@@ -680,7 +680,8 @@ bool row_fixed(const int* value) {
     return (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
            (value == &opts.resolution && ur::render_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
-           (value == &opts.astc_rgba8 && getenv("RX_VK_ASTC_RGBA8"));   // (set for the run: vk_texture.cpp reads it first)
+           (value == &opts.astc_rgba8 && getenv("RX_VK_ASTC_RGBA8")) ||   // (set for the run: vk_texture.cpp reads it first)
+           (value == &opts.item_hotkey && !opts.item_buttons);   // (hookshot: the hotkey waits for Item assignable buttons)
 }
 const char* tx_output_res(int v) {
     static char b[40];
@@ -822,6 +823,8 @@ const char* tx_stick_dead_zone(int v) {
     static const char* t[] = {"Default (24%)", "5%", "10%", "15%", "20%", "30%"};
     return (unsigned)v < 6 ? t[v] : t[0];
 }
+// (hookshot) Item button hotkey: the Switch's L or R, on whatever the controls put it (host/oot_item_buttons.c)
+const char* tx_item_hotkey(int v) { return v ? "R" : "L"; }
 // (hookshot) Audio output: the speakers the game mixes for, read once at its start (host/nn_audio.c au_menu_output)
 const char* tx_audio_output(int v) {
     static const char* t[] = {"Auto", "Stereo", "5.1"};
@@ -1160,6 +1163,21 @@ MENU_HINTS(hn_prompts, 0,
            "alone).",
            "The Switch's buttons.", "An Xbox controller's.", "A PlayStation 4 controller's.", "A PlayStation 5 controller's.",
            "A Steam Deck's.", "The keys and mouse buttons your controls put each action on.")
+// (hookshot) Item assignable buttons (host/oot_item_buttons.c): the hotkey is the Switch's L or R, and the other one still
+// opens the game's quick-switch menu
+MENU_HINTS(hn_item_buttons, 0, "The game's own: one item, on ZR.",
+           "In play, hold the hotkey and press A, B, X or Y to use the item on that button, as ZR does. In the quick-switch "
+           "menu, the hotkey and one of them puts the highlighted item on it, or takes it off. Turned on now, the boxes "
+           "on the HUD and the menus' Assign guides come with the next start.")
+/// The Item button hotkey: the button chosen; variant 1: Item assignable buttons is Off (the row waits for it)
+const char* hn_item_hotkey(int v, int variant) {
+    static const char* const t[] = {"Hold L for the items: it no longer opens the quick-switch menu. R still does.",
+                                    "Hold R for the items: it no longer opens the quick-switch menu. L still does."};
+    static const char* const unused = "Used by Item assignable buttons: set them On in the row above.";
+    if (variant < 0) variant = opts.item_buttons ? 0 : 1;
+    if (variant == 1) return unused;
+    return variant == 0 ? t[v ? 1 : 0] : nullptr;
+}
 
 Row rows[] = {
     // Graphics, in sections: a heading row is a section's title (draw_options draws it, the selection steps over it). The
@@ -1290,7 +1308,7 @@ Row rows[] = {
      "Skips the new-game opening (the story movie and Navi waking Link) and leaves later cutscenes, the Deku Tree "
      "meeting, and the title screen alone.", nullptr, false, true},
 
-    // Controls (12 rows; Motion opens the 6 TAB_MOTION rows, Controls its page with the 2 TAB_PAGE rows)
+    // Controls (15 rows; Motion opens the 6 TAB_MOTION rows, Controls its page with the 2 TAB_PAGE rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
      "Whether the controller plays the game while another window has the focus.", hn_background, false, true},
     {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam, "How the captured mouse turns the camera.",
@@ -1316,6 +1334,13 @@ Row rows[] = {
      "The game's own dead zone still follows.", nullptr, false, true},
     {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 150, 25, tx_rumble,
      "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", nullptr, false, true},
+    // (hookshot) Item assignable buttons: the hotkey's row is fixed while they are Off (row_fixed)
+    {TAB_CONTROLS, "Item assignable buttons", &opts.item_buttons, 0, 1, 1, tx_onoff,
+     "Puts an item on each of A, B, X and Y, used while the hotkey, a shoulder button, is held. Each save keeps its own "
+     "items, written when the game saves.", hn_item_buttons, false, true},
+    {TAB_CONTROLS, "Item button hotkey", &opts.item_hotkey, 0, 1, 1, tx_item_hotkey,
+     "Which shoulder button is held to use the items on A, B, X and Y: the Switch's L or R, on whatever your controls put "
+     "it.", hn_item_hotkey, false, true},
     {TAB_MOTION, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
      "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch. Works with Switch Pro "
      "controllers and pads in Switch mode, DualSense and DualShock 4. Shown beside it: whether the connected pad has one.", hn_gyro,

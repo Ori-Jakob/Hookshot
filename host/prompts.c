@@ -14,7 +14,8 @@
    The font as built: an OpenType font behind an 8-byte header, XORed per little-endian word with the key the header's magic
    (0x18029a7f) gives. Its cmap has, for each face, one icon per pad input at U+F700 + 32 x HOS_PROMPT_* + HOS_PAD_* and the
    face's d-pad icons at U+F700 + 32 x HOS_PROMPT_* + 24.., and each Switch button's and d-pad icon's code point in a format 4
-   segment of its own, by idDelta: pointing one at another icon is that segment's idDelta. The result goes out
+   segment of its own, by idDelta: pointing one at another icon is that segment's idDelta. It also has a comma and a plus,
+   which the control guide puts among its icons (hos_prompts_punctuation). The result goes out
    as a zstd frame of raw blocks (the file name says .zs; the game's decoder takes a frame made without its dictionary).
 
    The font is larger than the game's, and the game drops a file larger than its entry in the resource size table: the
@@ -120,6 +121,21 @@ static int keyboard_built;   /* (the build made the keyboard face: prompts/keybo
 /* Auto's face: the first controller's (by SDL's name); with none, and none through XInput either, the keyboard's */
 static int auto_face(const char *name) {
     return !name[0] && keyboard_built && !hos_xinput_pads() ? HOS_PROMPT_KEYBOARD : face_of_name(name);
+}
+
+/* the Insert menu's Item assignable buttons as the game starts (hookshot_options.ini, read as choose_face reads its row's):
+   the item buttons' layouts are served only then (build_layouts) */
+static int item_buttons_on(const char *dir) {
+    char path[MAX_PATH], line[80];
+    int on = 0;
+    snprintf(path, sizeof path, "%shookshot_options.ini", dir);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "item_assignable_buttons=", 24)) on = atoi(line + 24) != 0;
+        fclose(f);
+    }
+    return on;
 }
 
 /* HOS_PROMPT_* (faces[]) */
@@ -240,6 +256,28 @@ static int bind_font(uint8_t *otf, size_t n, int face) {
             done = cmap4_bind(cmap + so, sl <= len - so ? sl : len - so, face);
         }
         return done;
+    }
+    return 0;
+}
+
+/* 1 when the decrypted font's first format 4 subtable maps code (bind_font's walk) */
+static int font_maps(const uint8_t *otf, size_t n, unsigned code) {
+    if (n < 12) return 0;
+    const unsigned tables = rd16(otf + 4);
+    for (unsigned t = 0; t < tables && 12 + 16 * (size_t)(t + 1) <= n; t++) {
+        const uint8_t *rec = otf + 12 + 16 * t;
+        if (memcmp(rec, "cmap", 4)) continue;
+        const uint32_t off = rd32(rec + 8), len = rd32(rec + 12);
+        if (off > n || len > n - off || len < 4) return 0;
+        const uint8_t *cmap = otf + off;
+        const unsigned subs = rd16(cmap + 2);
+        for (unsigned s = 0; s < subs && 4 + 8 * (size_t)(s + 1) <= len; s++) {
+            const uint32_t so = rd32(cmap + 4 + 8 * s + 4);
+            if (so > len || len - so < 14 || rd16(cmap + so) != 4) continue;
+            const unsigned sl = rd16(cmap + so + 2);
+            return cmap4_glyph(cmap + so, sl <= len - so ? sl : len - so, code) != 0;
+        }
+        return 0;
     }
     return 0;
 }
@@ -1011,6 +1049,17 @@ static int text_code(unsigned c, int face, const int *bind) {   /* the code that
     return BIND_BASE + (face * HOS_SW_N + b) * HOS_PAD_ART_N + pad;
 }
 
+/* the game's own code of what a text's code shows (a Switch button's or a d-pad icon's), the game's or one text_code gave it;
+   any other code as it is. host/oot_item_buttons.c compares a pane's text with the game's message of a key by it */
+unsigned hos_prompts_game_code(unsigned c) {
+    if (c >= BIND_BASE && c < BIND_BASE + HOS_PROMPT_N * HOS_SW_N * HOS_PAD_ART_N)
+        return switch_code[(c - BIND_BASE) / HOS_PAD_ART_N % HOS_SW_N];   /* (text_code's: the inputs with artwork) */
+    if (c >= PAD_BASE + STATIC_AT && c < PAD_BASE + FACE_CODES * HOS_PROMPT_N && (c - PAD_BASE) % FACE_CODES >= STATIC_AT &&
+        (c - PAD_BASE) % FACE_CODES < STATIC_AT + 3)
+        return static_code[(c - PAD_BASE) % FACE_CODES - STATIC_AT];
+    return c;
+}
+
 /* the box's codes for the buttons as they are now; 1 when it changed them */
 static int text_rewrite(uint64_t box) {
     if (!font_changes) return 0;
@@ -1217,29 +1266,57 @@ static void ring_places(const int *bind, int place[4]) {
      u32 count of pad inputs, each one's icon's extra width (f32), u32 panes; each: u32 offset, u8 slot, 3 bytes, f32 x): each
      icon the one before's extra further on, the last one where it is;
    the game's own bytes when both are as the game has them (served all the same: a change while it runs is written where
-   the game keeps it, find_layouts) */
+   the game keeps it, find_layouts).
+   With the HUD's item buttons built (item_buttons/Common.blarc, nx2/item_buttons_layout.py: the game's layouts with four item
+   boxes and a hint added to the HUD's and a key guide to the quick-switch menu's, every other layout where the game has it,
+   so the runs fit it as they fit the game's) and Item assignable buttons on as the game starts (item_buttons_on), that is
+   the base instead: served as item_buttons/Common.blarc.zs with the runs or without, prompts/ or not, and the file a change
+   while the game runs puts the bytes back from. Its stamp, written after it, says it is whole, and goes into the key. With
+   the row off, the game's own layouts: a player who never turns it on loads nothing of the item buttons' */
 static int build_layouts(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
-    int face;
-    if (!setup(dir, sizeof dir, &face)) return 0;
+    int face = HOS_PROMPT_SWITCH;
+    const int prompts = setup(dir, sizeof dir, &face);
+    if (!prompts && !game_dir(dir, sizeof dir)) return 0;
+    long sn = 0;
+    snprintf(path, sizeof path, "%sitem_buttons/Common.blarc.stamp", dir);
+    uint8_t *stamp = read_all(path, NULL, &sn);
+    if (stamp && !item_buttons_on(dir)) {
+        hos_log("prompts: the game's own layouts, Item assignable buttons being off (its HUD boxes and guides come with the "
+                "next start once it is on)");
+        free(stamp);
+        stamp = NULL;
+    }
     int bind[BINDS];
     current_binds(bind);
     Layout o;
-    if (!layout_runs(dir, face, bind, &o)) return 0;
+    const int runs = prompts && layout_runs(dir, face, bind, &o);
+    if (!runs && !stamp) return 0;
+    if (!runs) {
+        memset(&o, 0, sizeof o);
+        o.h = 0xcbf29ce484222325ull;   /* (as layout_runs starts it) */
+    }
+    const int items = stamp != NULL;
+    const char *base = items ? "item_buttons" : "prompts";
+    if (items) o.h = fnv(o.h, stamp, (size_t)sn);
+    free(stamp);
     char keypath[MAX_PATH];
-    snprintf(out, cap, "%sprompts/Common.blarc.zs", dir);
-    snprintf(path, sizeof path, "%sprompts/Common.blarc", dir);
-    snprintf(keypath, sizeof keypath, "%sprompts/Common.blarc.key", dir);
+    snprintf(out, cap, "%s%s/Common.blarc.zs", dir, base);
+    snprintf(path, sizeof path, "%s%s/Common.blarc", dir, base);
+    snprintf(keypath, sizeof keypath, "%s%s/Common.blarc.key", dir, base);
     FILE *f = fopen(path, "rb");
     long n = 0;
     const int headed = f && fread(lay_head, 1, sizeof lay_head, f) == sizeof lay_head && !in_runs(0, sizeof lay_head, o.runs, o.n) &&
                        !fseek(f, 0, SEEK_END) && (n = ftell(f)) > 0;
     if (f) fclose(f);
     const int ok = write_patched(path, out, keypath, o.h, o.runs, o.n);
-    hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s%s", o.place[0], o.place[1],
-            o.place[2], o.place[3], o.spread ? "spread" : "as is", ok ? "" : ": could not be written");
-    if (ok) part_served(PART_LAYOUTS, face, bind);
-    if (ok && headed) {   /* (for find_layouts: the file, and the runs served) */
+    if (runs)
+        hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s%s", o.place[0], o.place[1],
+                o.place[2], o.place[3], o.spread ? "spread" : "as is", ok ? "" : ": could not be written");
+    if (items)
+        hos_log("prompts: the layouts with the HUD's item buttons (item_buttons)%s", ok ? "" : ": could not be written");
+    if (ok && runs) part_served(PART_LAYOUTS, face, bind);
+    if (ok && runs && headed) {   /* (for find_layouts: the file, and the runs served) */
         snprintf(lay.path, sizeof lay.path, "%s", path);
         lay.guarded = 1;
         lay_n = (uint64_t)n;
@@ -1335,6 +1412,12 @@ static int game_table(char *out, size_t cap) {
     return 1;
 }
 
+static volatile LONG punctuation;   /* the font served maps U+002C and U+002B (nx2/prompt_assets.py guide_marks) */
+
+/* the control guide may write ',' and '+' among its icons (host/oot_item_buttons.c): the font served is Hookshot's and has
+   them. 0 until the game has asked for its font (it does at its start), and with the game's own or a mod's */
+int hos_prompts_punctuation(void) { return punctuation != 0; }
+
 /* builds prompts/External.bfotf.zs for this run; 1 when there is one */
 static int build(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
@@ -1353,6 +1436,8 @@ static int build(char *out, size_t cap) {
     uint8_t *b = font_bound(dir, face, &n, &key, &bound);
     if (!b) return 0;
     if (n >= 8 + 64) memcpy(font.head, b + 8, sizeof font.head);
+    /* (a prompts folder made before the marks were: spaces in the guide) */
+    const int marks = font_maps(b + 8, (size_t)n - 8, 0x2C) && font_maps(b + 8, (size_t)n - 8, 0x2B);
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
     snprintf(out, cap, "%sprompts/External.bfotf.zs", dir);
     const int ok = write_zstd_raw(out, b, (size_t)n);
@@ -1363,8 +1448,9 @@ static int build(char *out, size_t cap) {
         font.n = n >= 8 + 64 ? (uint32_t)n : 0;
     }
     free(b);
-    hos_log("prompts: %s icons, %d buttons on these %s%s", faces[face], bound, face == HOS_PROMPT_KEYBOARD ? "keys" : "pad's controls",
-            ok ? "" : ": could not be written");
+    InterlockedExchange(&punctuation, ok && marks);
+    hos_log("prompts: %s icons, %d buttons on these %s%s%s", faces[face], bound, face == HOS_PROMPT_KEYBOARD ? "keys" : "pad's controls",
+            marks ? ", the control guide's comma and plus" : "", ok ? "" : ": could not be written");
     return ok;
 }
 

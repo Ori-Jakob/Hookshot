@@ -8,7 +8,8 @@ a key without an icon or on none the face's icon of its pad input; the sticks th
 own); in a text, a button on a key a code of its own (key_slot), the sticks' codes the face's. Also the faces' order:
 host/prompts.c faces[], gpu/vk/vk_api.h HOS_PROMPT_* and nx2/prompt_faces.py FACES (after the Switch, then the keyboard), and the
 defaults: host/prompts.c switch_pad, static_code and stick_code, nx2/prompt_assets.py DEFAULT and STATIC, nx2/prompt_keys.py
-STICKS and the code points.
+STICKS and the code points. And the check of the font served
+for the control guide's comma and plus (font_maps): a font made the same way maps U+002C and U+002B only when they were added.
 
 python -I -B tests/test_prompt_font_bind.py [--cc gcc]
 """
@@ -141,12 +142,17 @@ def main():
         block(src, "static int cmap4_point("),
         block(src, "static int cmap4_bind("),
         block(src, "static int bind_font("),
+        block(src, "static int font_maps("),
         "int main(int argc, char **argv) {",
         "    FILE *f = fopen(argv[1], \"rb\");",
         "    static unsigned char st[65536];",
         "    const size_t n = fread(st, 1, sizeof st, f);",
         "    fclose(f);",
         "    if (argc > 2 && !strcmp(argv[2], \"font\")) { printf(\"%d\\n\", bind_font(st, n, 0)); return 0; }",
+        "    if (argc > 2 && !strcmp(argv[2], \"maps\")) {",
+        "        for (int i = 3; i < argc; i++) printf(\"%d\\n\", font_maps(st, n, (unsigned)strtoul(argv[i], NULL, 0)));",
+        "        return 0;",
+        "    }",
         "    printf(\"%d\\n\", cmap4_bind(st, n, atoi(argv[2])));",
         "    for (int i = 3; i < argc; i++) printf(\"%u\\n\", cmap4_glyph(st, n, (unsigned)strtoul(argv[i], NULL, 0)));",
         "    return 0;",
@@ -166,6 +172,17 @@ def main():
         wrapped = subprocess.run([str(exe), str(font), "font"], capture_output=True, text=True)
         check(wrapped.returncode == 0 and wrapped.stdout.split() == ["0"],
               "a cmap subtable offset that wraps: exit %d, %r" % (wrapped.returncode, wrapped.stdout))
+        wrapped = subprocess.run([str(exe), str(font), "maps", "0x2C"], capture_output=True, text=True)
+        check(wrapped.returncode == 0 and wrapped.stdout.split() == ["0"], "font_maps past a wrapping subtable offset")
+        # the control guide's comma and plus (prompt_assets.guide_marks): told only when the served font maps both
+        for marks in ({}, {0x2C: 1000}, {0x2C: 1000, 0x2B: 1001}):
+            table = prompt_assets.cmap4({**mapping, **marks}, set(prompt_assets.SWITCH) | set(prompt_assets.STATIC))
+            font.write_bytes(bytes(4) + (1).to_bytes(2, "big") + bytes(6) + b"cmap" + bytes(4) + (28).to_bytes(4, "big") +
+                             len(table).to_bytes(4, "big") + table)
+            got = subprocess.run([str(exe), str(font), "maps", "0x2C", "0x2B", "0xE040", "0x2D"], check=True,
+                                 capture_output=True, text=True).stdout.split()
+            check(got == ["1" if 0x2C in marks else "0", "1" if 0x2B in marks else "0", "1", "0"],
+                  "font_maps of a cmap with %s: %s" % (sorted(hex(k) for k in marks), got))
     pads_of = {p: i for i, p in enumerate(prompt_assets.PADS)}
     nsw, nst = len(prompt_assets.SWITCH), len(prompt_assets.STATIC)
     for f, out in enumerate(outs):
@@ -188,7 +205,7 @@ def main():
             check(got[nsw + nst + c] == want, "face %d: face icon U+%04X moved" % (f, prompt_assets.PAD_BASE + c))
     texts = check_text_code(a.cc, src, nfaces)
     print("ok: on each of %d faces, %d of %d Switch buttons pointed at the face's pad icons (a paddle at its default's), the "
-          "rest at their defaults', the d-pad at its own; the faces' icons kept; %d text codes rewritten" % (nfaces, len(BIND), len(prompt_assets.SWITCH), texts))
+          "rest at their defaults', the d-pad at its own; the faces' icons kept; %d text codes rewritten; the comma and plus told" % (nfaces, len(BIND), len(prompt_assets.SWITCH), texts))
 
 
 def check_text_code(cc, src, nfaces):

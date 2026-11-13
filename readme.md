@@ -377,6 +377,8 @@ HDR, Detail, and GPU and memory (last: the rows to change when something is wron
 | | Camera speed | 50% to 400%, in steps of 25 | 100% |
 | | Stick dead zone | Default (24%), 5%, 10%, 15%, 20%, 30% | Default (24%) |
 | | Rumble strength | Off, 25% to 150%, in steps of 25 | 100% |
+| | Item assignable buttons | Off, On | Off |
+| | Item button hotkey | L, R (used while Item assignable buttons is On) | L |
 | | Layout preset | Nintendo (Def), Xbox / PC, Swap Face, Custom (on the Controls page) | Nintendo (Def) |
 | | Button prompts | Auto, Switch, Xbox, PlayStation 4, PlayStation 5, Steam Deck (on the Controls page) | Auto |
 | | Motion | Opens the Motion page: Motion controls (Off, On; On), Motion sensitivity X (10% to 600%) and Y (10% to 300%; 100%), Invert motion X and Y (Off, On; Off), Motion deadzone (Low, Standard, High; Standard) | |
@@ -561,6 +563,8 @@ HDR, Detail, and GPU and memory (last: the rows to change when something is wron
   a lower value for a precise stick or a higher one for a stick that drifts. The game also applies its own dead zone.
 - **Rumble strength** scales the controller's rumble: 100% is the game's own, Off turns it off. The game's HD rumble
   goes to a controller's heavy and light motors by its frequency.
+- **Item assignable buttons** puts an item on each of A, B, X and Y, beside the one on ZR, used while the **Item button
+  hotkey** (L or R) is held. How to use and choose them: [Controls](#controls).
 - **Motion controls** (Controls tab, Motion page): the controller's gyroscope aims where the game uses motion, as on the Switch. It works with
   Switch Pro controllers and pads in Switch mode, DualSense and DualShock 4 (through SDL). Its row
   says whether the connected pad has a gyroscope; Off leaves the game seeing a pad lying still. **Motion sensitivity X/Y**
@@ -599,6 +603,30 @@ it. Without them the kernel's hid-nintendo driver runs the controller, and it ge
 anything SDL reports as a Switch Pro Controller or Joy-Con, and that includes third-party controllers in Switch mode
 (8BitDo, GameSir and others; SDL gives them Nintendo's ids). Some of them may turn it into weak rumble or none: set
 `HOS_HD_RUMBLE=0` to give them the plain motor rumble.
+
+**Item buttons:** with **Item assignable buttons** On (Controls tab), A, B, X and Y each carry an item of your choice
+beside the one on ZR. In play, hold the **Item button hotkey** (L by default, or R) and press one of them to use its
+item as ZR would: hold the button to draw the bow, let go to shoot. The hotkey no longer opens the quick-switch menu;
+the other shoulder button still does. To choose the items, open the quick-switch menu with that other button, highlight
+an item, then hold the hotkey and press A, B, X or Y; the menu's guide shows these keys beside **Assign**. The pause
+menu's Items page takes the same press on the item under the cursor, and its pages turn with ZL and ZR alone while the
+feature is on (the tab bar shows them; L and R do nothing there). The same press on an item that is already on that
+button takes it off, and an item is on one button at a time. An item on a face button shows that button's icon in the
+quick-switch menu (under the item) and on the Items page (on the top right corner of its box), and has a light-blue box
+in both, where the ZR item has its gold one. Child and adult Link have four each, and
+the HUD shows them beside the ZR item with the hotkey's button icon over them, larger while the hotkey is held. While an
+item used this way is out (a drawn bow, a carried bomb), ZR uses it too, as if ZR had drawn it, and the hints at the
+bottom of the screen show it beside ZR ("Fire ZR, L + A"; with the game's own button icons, without the comma and the
+plus); once it is put away ZR is the ZR item again. The hotkey is the Switch's L or R, so it follows the gamepad button
+or key your controls put it on. Each save keeps its own items, in an `item_buttons.ini` in that save's folder
+(`save/<user id>/slot_NN/`, under `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux). The file is
+written when the game saves, into the slot it saves to, so choosing items changes them for the game you are playing and
+quitting without saving loses the change, as it does a change of the ZR item. When a save loads, an item it does not
+hold for that age (or one the file names wrongly) comes off its button, and a new game starts with none. The game never
+reads the file: your saves stay usable on a console and in other programs, and `scripts/oot_saves.py` carries it with
+its slot ([using a save from an emulator](docs/saves.md)). The HUD's boxes, the Assign guides and the Items page's icons
+are layouts the game loads only when the option is on as it starts: turned on while you play, the buttons work at once
+and those come with the next start; left off, the game loads its own layouts.
 
 To change which gamepad button or key presses a Switch button, or which keys move and turn the camera, open the
 Controls tab's Controls page. Choose a row and a column (Gamepad or Keyboard), press <kbd>Enter</kbd> (or the bottom
@@ -748,7 +776,7 @@ use them.
 |---|---|
 | `image.bin` | The game image to run. Without it the game uses the `image.bin`, `romfs` and `user` in its folder |
 | `--romfs <folder>` | The extracted RomFS folder |
-| `--user <folder>` | Where the game keeps per-user data: saves, caches and temp files (and `mouse_sens.txt` when `HOS_MOUSE_SENS` is set; the menu keeps the sensitivity otherwise). Default: `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux; with an explicit image path, `user` in the current folder |
+| `--user <folder>` | Where the game keeps per-user data: saves (each save slot's folder with that save's `item_buttons.ini` for the item buttons), caches and temp files (and `mouse_sens.txt` when `HOS_MOUSE_SENS` is set; the menu keeps the sensitivity otherwise). Default: `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux; with an explicit image path, `user` in the current folder |
 | `--trace` | Log every Horizon OS call (the same as `HOS_TRACE=1`) |
 | `--prepare-shaders` | Prepare the shaders as the first start does, then exit without starting the game (no build step runs it) |
 

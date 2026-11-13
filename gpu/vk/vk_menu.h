@@ -99,6 +99,8 @@ struct Options {
     int game_lang = 0;    // the game's language (vk_menu_i18n.h game_lang_code): language.txt's, not kept in the options file
     int menu_lang = 0;    // this menu's language: 0 Auto (the game's own, language.txt), else menu_i18n::kLangs[menu_lang - 1]
                           // (vk_menu_i18n.cpp). Saved as menu_language
+    int item_buttons = 0;  // (hookshot) Item assignable buttons (host/oot_item_buttons.c): 1 on, A, B, X and Y use an item each while the hotkey is held; each save's are in its slot folder's item_buttons.ini
+    int item_hotkey = 0;   // (hookshot) their hotkey, the Switch's shoulder button held for them: 0 L, 1 R (the other one still opens the game's quick-switch menu)
     int mic = 1;          // (hookshot) the ocarina's microphone: 0 Off, 1 the system's default, 2.. a device as host->mic_name lists it (host/nn_audio_in.c)
 };
 extern Options opts;

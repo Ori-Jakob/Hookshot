@@ -216,6 +216,11 @@ void hos_mouse_game_menu(void);   /* (display.c) */
 void hos_mouse_game_menu_gone(void);
 int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel);
 void hos_hid_tap(const char *press);   /* (nn_hid.c) */
+/* (oot_item_buttons.c) Item assignable buttons on: the pause menu's pages turn with ZL and ZR alone, which the game takes as
+   it takes L and R (its filter hides L and R there); the Minus panel's keep L and R. Its Assign guide, shown on the Items
+   page, is the last of the bottom row (right-aligned): the room it takes there, the row's other guides that far left */
+int ib_enabled(void);
+int ib_pause_footer_shift(void);
 void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms);
 void hos_hid_drag(int dx, int dy, int right);   /* (nn_hid.c: as the camera's mouse; the left stick or the right) */
 /* The panel of Key Items, Threads of Time and Map (Minus opens it; L to the left, R to the right; pages 0, 1, 2), as
@@ -301,11 +306,18 @@ static void list_boxes(Hit *h) {
     memcpy(h->rect, out, (size_t)h->n * sizeof *out);
 }
 
+/* The "Back" prompt at the bottom right (B), on every screen with one (the title's load list, the pause menu, the map; in
+   the layout's units, measured from their screens): x 1600 to 1900 less the shift, y -1080 to -960. The shift: on the pause
+   menu the room the item buttons' Assign guide takes at the row's right end while it is shown, 0 elsewhere */
+static float back_shift(uint64_t screen) { return screen == pause_screen_now() ? (float)ib_pause_footer_shift() : 0.0f; }
+static int at_back(float x, float y, float shift) { return y > -1080 && y < -960 && x >= 1600 - shift && x < 1900 - shift; }
+
 static void hit_test(uint64_t screen, Hit *h) {
     h->n = 0, h->hit = 0;
     each_entry(screen, 400, shown_entry, h);
     list_boxes(h);
-    if (h->y > -1080 && h->y < -960 && h->x >= 1600 && h->x < 1900) return;   /* (the "Back" prompt's: no button's) */
+    const float shift = back_shift(screen);
+    if (h->y > -1080 && h->y < -960 && h->x >= 1600 - shift && h->x < 1900) return;   /* (the prompts': no button's) */
     for (int i = 0; i < h->n; i++) {
         const Rect *r = &h->rect[i];
         if (h->x < r->x0 || h->x > r->x1 || h->y < r->y0 || h->y > r->y1) continue;
@@ -433,9 +445,9 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
         if (map && (pressed & HOS_MOUSE_MIDDLE)) hos_hid_tap("0:Y/80");
         if (ldown) moved = 0;   /* (no hover while dragging) */
     }
-    /* the wheel: the pause menu's pages (L, R). Elsewhere it scrolls a list: the focus to the row shown last that way
-       (the lowest for down), then the pad's down (up) a notch each, which moves the list on by a row as at its end;
-       then the focus back to the row the mouse is over */
+    /* the wheel: the pause menu's pages (L, R; ZL, ZR with the item buttons on). Elsewhere it scrolls a list: the focus to
+       the row shown last that way (the lowest for down), then the pad's down (up) a notch each, which moves the list on by
+       a row as at its end; then the focus back to the row the mouse is over */
     static int64_t refocus_ns;
     static uint64_t scroll_row;   /* (the row the wheel gave the focus, out of view) */
     static float scroll_lo, scroll_hi;
@@ -519,9 +531,10 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
             hit.hit = 0;
             list = 0;   /* (no pad presses) */
         }
+        const int z = pause && ib_enabled();
         for (int i = 0; list && i < k && i < 6; i++)
             n += snprintf(taps + n, sizeof taps - (size_t)n, "%s%.2f:%s/60", n ? "," : "", at + i * 0.12,
-                          pause ? (wheel > 0 ? "L" : "R") : (wheel > 0 ? "UP" : "DOWN"));
+                          pause ? (wheel > 0 ? (z ? "ZL" : "L") : (z ? "ZR" : "R")) : (wheel > 0 ? "UP" : "DOWN"));
         if (n) hos_hid_tap(taps);
     }
     /* (the list has moved under the mouse: the row the wheel gave the focus is in view, as the list scrolls at its own
@@ -547,10 +560,11 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
                     text_at(peek64(hit.hit + 0x18), name, sizeof name), r, (unsigned long long)screen);
         }
     }
-    /* a click on the tabs: L or R pressed as many times as the pages between (one at a time, as the pages slide) */
+    /* a click on the tabs: L or R pressed as many times as the pages between (one at a time, as the pages slide); ZL or ZR
+       with the item buttons on */
     if (pause && (pressed & HOS_MOUSE_LEFT) && !hit.hit) {
-        const int tab = tab_at(hit.x, hit.y);
-        if (tab == TAB_L || tab == TAB_R) hos_hid_tap(tab == TAB_L ? "0:L/120" : "0:R/120");
+        const int tab = tab_at(hit.x, hit.y), z = ib_enabled();
+        if (tab == TAB_L || tab == TAB_R) hos_hid_tap(tab == TAB_L ? (z ? "0:ZL/120" : "0:L/120") : (z ? "0:ZR/120" : "0:R/120"));
         else if (tab >= 0 && page_now >= 0 && tab != page_now) tab_goal = tab, tab_pages = 4, goal_ns = now, tab_from = -9;
         if (trace && tab != -1) hos_log("menu: mouse (%.0f, %.0f): tab %d from page %d", hit.x, hit.y, tab, page_now);
     }
@@ -565,10 +579,12 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
         if (tab_goal >= 0) {
             if (cur == tab_goal) tab_goal = -1;
             else if (cur != tab_from && now - arrive_ns > 250000000) {
-                const int d = tab_goal - cur;
-                if (tab_pages == 4) hos_hid_tap(d < 0 ? "0:L/120" : "0:R/120");
+                const int d = tab_goal - cur, z = ib_enabled();
+                if (tab_pages == 4) hos_hid_tap(d < 0 ? (z ? "0:ZL/120" : "0:L/120") : (z ? "0:ZR/120" : "0:R/120"));
                 else hos_hid_tap(d < 0 ? "0:L/75" : "0:R/75");   /* (the panel: 75 ms, not into the next page) */
-                if (trace) hos_log("menu: tab: page %d toward %d: %s", cur, tab_goal, d < 0 ? "L" : "R");
+                if (trace)
+                    hos_log("menu: tab: page %d toward %d: %s", cur, tab_goal,
+                            tab_pages == 4 && z ? (d < 0 ? "ZL" : "ZR") : (d < 0 ? "L" : "R"));
                 tab_from = cur;
             }
         }
@@ -687,9 +703,8 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
         if (tap[0]) hos_hid_tap(tap);
         if (trace) hos_log("menu: panel page %d click (%.0f, %.0f): %s", page, hit.x, hit.y, tap[0] ? tap : "-");
     }
-    /* The "Back" prompt at the bottom right (B), on every screen with one (the title's load list, the pause menu, the
-       map; in the layout's units, measured from their screens): a click there off the buttons */
-    if ((pressed & HOS_MOUSE_LEFT) && !hit.hit && hit.y > -1080 && hit.y < -960 && hit.x >= 1600 && hit.x < 1900) {
+    /* The "Back" prompt (at_back): a click there off the buttons */
+    if ((pressed & HOS_MOUSE_LEFT) && !hit.hit && at_back(hit.x, hit.y, back_shift(screen))) {
         hos_hid_tap("0:B/80");
         if (trace) hos_log("menu: the Back prompt clicked (%.0f, %.0f)", hit.x, hit.y);
     }
@@ -812,7 +827,13 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     ReleaseSRWLockExclusive(&seen_lock);
     if (gone) hos_mouse_game_menu_gone();
     if (mine) mouse_tick(c, screen);
-    if (screen == pause_screen_now()) InterlockedIncrement(&ticks);
+    if (screen == pause_screen_now()) {
+        InterlockedIncrement(&ticks);
+        static volatile LONG shift_was;
+        const LONG shift = ib_pause_footer_shift();
+        if (trace && InterlockedExchange(&shift_was, shift) != shift)
+            hos_log("menu: the pause menu's Back prompt %ld to the left (the room of the item buttons' Assign guide)", (long)shift);
+    }
 }
 #else
 void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr) { (void)c, (void)screen, (void)pane, (void)lr; }

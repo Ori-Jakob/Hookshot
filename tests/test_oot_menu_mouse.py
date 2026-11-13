@@ -10,12 +10,14 @@ its button; the pad's presses (hos_hid_tap) are recorded as their script.
 
 In the pause menu the mouse moved onto a button gives it the focus through the setter, a click on the focused button is
 A and the right button B, a click on the "Back" prompt is B even with a button's box under it, the L and R signs are L
-and R and the wheel turns the pages. A slot whose hit box covers a side of its picture is hit on the other side too. A
-focus change the game reports from another thread while the setter runs (the mouse's lock held) does not wait for the
-lock, and is the mouse's at its next tick. On a
-list of the title's 60 x 60 marks a row is hit across the line and in the gaps between rows, and the wheel moves the
-focus down a row with the setter, without the pad. On the R button's item choice (a carousel) the wheel presses the
-D-pad's right (down) and left (up), a notch each, one after another, and the mouse is not freed (it stays the
+and R and the wheel turns the pages (ZL and ZR with Item assignable buttons on: the game's other pair for its pages).
+With the item buttons' Assign guide shown on the Items page (the last of the bottom row, right-aligned), "Back" is as
+far left as the guide takes room (ib_pause_footer_shift): a click there is B, a click on the guide nothing. A slot
+whose hit box covers a side of its picture is hit on the other side too. A focus change the game reports from another
+thread while the setter runs (the mouse's lock held) does not wait for the lock, and is the mouse's at its next tick.
+On a list of the title's 60 x 60 marks a row is hit across the line and in the gaps between rows, and the wheel moves
+the focus down a row with the setter, without the pad. On the R button's item choice (a carousel) the wheel presses
+the D-pad's right (down) and left (up), a notch each, one after another, and the mouse is not freed (it stays the
 camera's). With the cursor hidden (R held counts as the pad in use) the wheel still moves a list, and moving the mouse
 points at nothing. Once frames go on with no menu holding the mouse, the window is told at once.
 python -I -B tests/test_oot_menu_mouse.py   (Windows: the feature's; elsewhere it is skipped)
@@ -82,6 +84,10 @@ static char taps[1024];
 void hos_hid_tap(const char *press) { strncat(taps, press, sizeof taps - strlen(taps) - 2), strcat(taps, ";"); }
 void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms) { (void)lx, (void)ly, (void)rx, (void)ry, (void)hold_ms; }
 void hos_hid_drag(int dx, int dy, int right) { (void)dx, (void)dy, (void)right; }
+static int item_buttons;   /* (Item assignable buttons on: the pause menu's pages turn with ZL and ZR) */
+int ib_enabled(void) { return item_buttons; }
+static int footer_shift;   /* (the Assign guide shown on the Items page: the room it takes at the bottom row's right end) */
+int ib_pause_footer_shift(void) { return footer_shift; }
 static uint64_t focus_asked, focus_screen;
 static int focus_calls;
 /* (a focus change reported from another of the game's threads while the setter runs: the hook there must not wait for
@@ -195,6 +201,33 @@ int main(void) {
     wheel_next = -1;
     frame(pause, -1000, 1000);
     CHECK(!strcmp(taps, "0.00:R/60;"));   /* the wheel down: the next page */
+    item_buttons = 1;   /* (the item buttons on: ZL and ZR, the game's other pair for the pages) */
+    reset();
+    pressed_next = HOS_MOUSE_LEFT;
+    frame(pause, 1000, 1000);
+    CHECK(!strcmp(taps, "0:ZR/120;"));
+    reset();
+    pressed_next = HOS_MOUSE_LEFT;
+    frame(pause, -1000, 1000);
+    CHECK(!strcmp(taps, "0:ZL/120;"));
+    reset();
+    wheel_next = 1;
+    frame(pause, -1000, 1000);
+    CHECK(!strcmp(taps, "0.00:ZL/60;"));
+    /* the Assign guide shown at the row's right end (900 of room): a click on it is nothing (no B, the box under it not
+       focused or pressed), "Back" is 900 to the left */
+    footer_shift = 900;
+    reset();
+    frame(pause, 1800, -1020);
+    pressed_next = HOS_MOUSE_LEFT;
+    frame(pause, 1800, -1020);
+    CHECK(focus_asked != corner && taps[0] == 0);
+    reset();
+    pressed_next = HOS_MOUSE_LEFT;
+    frame(pause, 1700 - 900, -1020);
+    CHECK(!strcmp(taps, "0:B/80;"));
+    footer_shift = 0;
+    item_buttons = 0;
     reset();
     frame(pause, -1260, -400);
     CHECK(focus_asked == side);   /* the slot's picture's other side: hit */

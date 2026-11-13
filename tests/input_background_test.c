@@ -103,6 +103,12 @@ void hos_mouse_native_stick(int held) { (void)held; }
 static void mouse_setup(void) {}
 static void mouse_sens_keys(void) {}
 int mouse_stick(int32_t *x, int32_t *y, int held) { (void)x; (void)y; (void)held; mouse_queries++; return 0; }
+/* the item buttons (host/oot_item_buttons.c): off, the hotkey none and the filter a pass-through that sees each read's
+   final buttons once */
+int hos_oot_ib_hotkey(void) { return -1; }
+static int filter_calls;
+static uint64_t filtered;
+uint64_t hos_oot_ib_filter(uint64_t buttons) { filter_calls++; filtered = buttons; return buttons; }
 void rx_request_frame_dump(void) { commands++; }
 void rx_set_screenshot_ms(int64_t ms) { (void)ms; commands++; }
 void rx_request_rdoc_capture(int frames) { (void)frames; commands++; }
@@ -116,8 +122,10 @@ static void packet(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx) {
     context.x[0] = 64; context.x[1] = 2; context.x[2] = 16; context.x[30] = 0x1234;
     G32(16) = NPAD_NO1;
     memset(memory + 64, 0xa5, 2 * STATE_SIZE + 8);
+    const int calls = filter_calls;
     npad_states(&context);
     CHECK(context.x[0] == 2);
+    CHECK(filter_calls == calls + 1 && filtered == buttons);
     expected_sampling++;
     for (int i = 0; i < 2; i++) {
         const uint64_t address = 64 + (uint64_t)i * STATE_SIZE;

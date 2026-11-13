@@ -5064,6 +5064,11 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_event_signal = event_signal_queued;
     t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp; DLAA: full scale, vk_dlss.cpp)
         if (id == 11) return opts.stick_dead_zone;
+        // (hookshot) Item assignable buttons (host/oot_item_buttons.c): 12 whether they are on, 13 their hotkey, 0 L or 1 R.
+        // Numbers, as 11, 16 and 17: vk_api.h is part of the shader cache's stamp (nx2/build.py), so a name added there
+        // would start every player's cache again
+        if (id == 12) return opts.item_buttons;
+        if (id == 13) return opts.item_hotkey;
         if (id == HOS_OPT_CHEAT_HEARTS) return menu_heart_protection();
         if (id == HOS_OPT_CHEAT_FLIGHT) return menu_player_flight();
         if (id == HOS_OPT_CHEAT_ACTION) return menu_take_cheat_action();
