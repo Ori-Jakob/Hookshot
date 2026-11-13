@@ -8,6 +8,7 @@ anew, textures destroyed and submissions pass: the views, the stubs called and t
 python -I -B tests/test_flat_map.py --cxx clang++
 """
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ STUBS = r'''
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -186,8 +188,8 @@ int main() {
             destroy_gen++;
         } else if (what < 12) {
             epoch++;
-            if (old_impl::handle_hits().size() > 1024) old_impl::handle_hits().clear();
-            if (new_impl::handle_hits().size() > 1024) new_impl::handle_hits().clear();
+            if (old_impl::handle_hits().size() > 1024) old_impl::handle_hits().clear(), old_impl::front_clear();
+            if (new_impl::handle_hits().size() > 1024) new_impl::handle_hits().clear(), new_impl::front_clear();
         } else {
             const uint32_t handle = (uint32_t)(r() % 3000 + 1) | (uint32_t)(r() % 8) << 20;
             const VkImageViewType want = (VkImageViewType)(r() % 4);
@@ -225,10 +227,14 @@ def harness():
     draw = (VK / "vk_draw.cpp").read_text(encoding="utf-8")
     shader = (VK / "vk_shader.cpp").read_text(encoding="utf-8")
     hits = cut(draw, "struct HandleHit {", "\n// (hookshot) RX_VK_TRACE_TEX")
-    tls = re.search(r"TLS_OBJECT\(handle_hits, (.+)\)\s*$", hits, re.M)
-    if not tls:
+    if not re.search(r"^TLS_OBJECT\(handle_hits, (.+)\)\s*$", hits, re.M):
         raise SystemExit("handle_hits is no longer a TLS_OBJECT: update this check")
-    hits = hits[:tls.start()] + "inline %s& handle_hits() { static %s m; return m; }\n" % (tls.group(1), tls.group(1))
+    # (each thread-local object here, handle_hits and the front cache after it (view_fast), as one static)
+    hits = re.sub(r"^TLS_OBJECT\((\w+), (.+)\)[ \t]*$",
+                  lambda m: "inline %s& %s() { static %s m; return m; }" % (m.group(2), m.group(1), m.group(2)), hits, flags=re.M)
+    # (the replay forgets the front cache with the map; front_clear does that here)
+    hits += ("inline void front_clear() { for (auto& f : view_fast()) f.key = ~0ull; }\n" if "view_fast()" in hits
+             else "inline void front_clear() {}\n")
     view_of = cut(draw, "VkImageView texture_view_of(", "/// A uniform buffer's descriptor range")
     for name, text in (("vk_draw.cpp", draw), ("vk_shader.cpp", shader)):
         if '#include "flat_map.h"' not in text:
@@ -259,9 +265,12 @@ def main():
                                 "-I", str(VK), str(src), "-o", str(exe)], text=True, capture_output=True)
         if build.returncode:
             raise SystemExit(build.stderr[-4000:])
-        run = subprocess.run([str(exe)], text=True, capture_output=True, timeout=120)
-        if run.returncode or run.stdout.strip() != "same":
-            raise SystemExit(run.stderr or run.stdout or f"exit {run.returncode}")
+        # (once with the front cache off, so every lookup goes through the maps, and once with it on, as the replay runs)
+        for front in ("0", "1"):
+            run = subprocess.run([str(exe)], text=True, capture_output=True, timeout=120,
+                                 env=dict(os.environ, RX_VK_VIEW_FAST=front))
+            if run.returncode or run.stdout.strip() != "same":
+                raise SystemExit(f"RX_VK_VIEW_FAST={front}: " + (run.stderr or run.stdout or f"exit {run.returncode}"))
     print("PASS: FlatMap answers as std::unordered_map did, and texture_view_of does the same over either")
 
 
