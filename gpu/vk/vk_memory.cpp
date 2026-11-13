@@ -1445,8 +1445,9 @@ bool late_copy_plan(Capture& c, uint64_t value) {
     if (late_pages_n.load(std::memory_order_relaxed) >= kLatePagesMax) return false;   // (the CPU wait: no unbounded backlog)
     if (tex_capture_on()) {
         std::lock_guard sk(shadow_mu);
+        RangeWalk in_tex{tex_merged};   // (c.late's pages in address order, as c.pages)
         for (uint32_t i : c.late)
-            if (in_tex_merged((uint64_t)c.pages[i] << kPageShift)) return false;
+            if (in_tex.in((uint64_t)c.pages[i] << kPageShift)) return false;
     }
     static thread_local std::vector<std::pair<uint64_t, uint64_t>> pools;
     static thread_local std::vector<Pool*> owners;
