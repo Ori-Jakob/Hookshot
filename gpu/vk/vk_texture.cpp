@@ -55,6 +55,7 @@
 #include "vram_compact.h"
 #include "evict_reason.h"
 #include "keep_rendered.h"
+#include "keep_resampled.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
@@ -2595,6 +2596,10 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // GPU's texels, and a write before (another variable in the same page) re-uploaded garbage over a drawn LUT:
     // the rainbow sky)
     const uint32_t since = tex->gpu_written && tex->released ? std::max(tex->upload_gen, tex->release_gen) : tex->upload_gen;
+    // (hookshot) one the game finalized and samples after that: a cache it keeps (the shadow map it draws, finalizes and samples
+    // for hundreds of frames). The eviction pass keeps it over the budget: keep_resampled.h. Not only "well after it was drawn":
+    // the 12288 x 12288 shadow map was sampled within a few frames of being drawn, then went unused 400 frames and was evicted
+    if (tex->gpu_written && tex->released) tex->resampled = true;
     if (tex->gpu_written && tex->released && frame_no > tex->last_written + 60) {
         // (hookshot: one the game finalized, sampled again well after it was drawn: what the eviction keeps them for)
         static std::unordered_set<uint32_t> told;
@@ -2786,6 +2791,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         tex->upload_gen = gen;
         tex->gpu_written = false;
         tex->released = false;
+        tex->resampled = false;   // (drawn again: "sampled after finalizing" only once finalized again; keep_resampled.h)
     } else if (tex->bc) {
         // (hookshot) a BC3 image holds nothing until its encode has run. Marked uploaded as the others are, its blocks as the
         // memory had them were drawn as coloured noise, and never made again unless the game wrote its memory: the path, the
@@ -3637,6 +3643,7 @@ void texture_written(Texture* tex, const char* why) {
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
     tex->released = false;
+    tex->resampled = false;   // (drawn again: "sampled after finalizing" only once finalized again; keep_resampled.h)
     tex->uploaded = true;
 }
 
@@ -4607,9 +4614,14 @@ void texture_frame(uint64_t completed) {
     // after a while of play (issues 107 and 386). Kept, up to RX_VK_KEEP_FINALIZED_MB (512 by default; 0:
     // evicted as before), the least recently used beyond that going as before. (Not written back into the memory instead: the game
     // may have put other things there since, and a write-back over scene data once crashed it)
+    // (hookshot) the textures the GPU drew that the game samples again after finalizing them, used in the last 1,800 presents: kept
+    // over the budget up to RX_VK_KEEP_RESAMPLED_MB (512 by default, the most recently used first; 0: evicted as before). Their
+    // total first, as finalized_kept's: keep_resampled.h
+    static const uint64_t keep_resampled_max =
+        (uint64_t)(getenv("RX_VK_KEEP_RESAMPLED_MB") ? std::max(0, atoi(getenv("RX_VK_KEEP_RESAMPLED_MB"))) : 512) << 20;
     static const uint64_t keep_finalized_max =
         (uint64_t)(getenv("RX_VK_KEEP_FINALIZED_MB") ? std::max(0, atoi(getenv("RX_VK_KEEP_FINALIZED_MB"))) : 512) << 20;
-    const auto keep_finalized = [&](const Texture* tex) {
+    const auto finalized_once = [&](const Texture* tex) {   // (keep_finalized's textures, the resampled ones among them)
         if (!keep_finalized_max || !tex->gpu_written || !tex->released || !tex->first_written ||
             tex->first_written != tex->last_written || tex->bytes > (4ull << 20))
             return false;
@@ -4617,7 +4629,18 @@ void texture_frame(uint64_t completed) {
         if (g == gpu_owned.end() || g->second.first != tex->gpu + std::max<uint64_t>(tex->guest_size, 1)) return false;
         return !drawn_over(tex) && !drawn_over_shifted(tex);
     };
+    const auto keep_finalized = [&](const Texture* tex) {
+        // (a resampled one keep_resampled may keep is its, below, not counted here; with that rule off, kept here as before)
+        if (keep_resampled_max && tex->resampled && keep_resampled::recent(frame_no - tex->last_frame)) return false;
+        return finalized_once(tex);
+    };
     uint64_t finalized_kept = 0;
+    uint64_t resampled_total = 0;
+    if (keep_resampled_max)
+        for (auto& [last, tex] : order)
+            if (tex->resampled && tex->gpu_written && keep_resampled::recent(frame_no - last) &&
+                keep_resampled::candidate(drawn_over_shifted(tex) || drawn_over(tex), tex->gpu_written, tex->resampled, frame_no - last))
+                resampled_total += tex->bytes;
     size_t finalized_kept_n = 0;
     if (keep_finalized_max)
         for (auto& [last, tex] : order)
@@ -4680,6 +4703,18 @@ void texture_frame(uint64_t completed) {
         static const bool keep_over_only = env_on("RX_VK_KEEP_RENDERED_OVER");
         const uint64_t keep_rendered = keep_rendered::presents(known, used, allowed, keep_over_only);
         const bool overwritten = shifted || drawn_over(tex);   // (above)
+        // (above. Oldest first, as keep_finalized. Past its cap, a small finalized one is keep_finalized's again, below)
+        const bool resampled_candidate =
+            keep_resampled::candidate(overwritten, tex->gpu_written, tex->resampled, frame_no - last);
+        if (resampled_candidate && keep_resampled::keep(tex->bytes, resampled_total, keep_resampled_max)) {
+            static int logged;
+            if (logged++ < 20)
+                logf("vk: texture #%u %#llx %ux%u NVN %#x (%llu MB) the GPU drew and the game samples again after finalizing it: kept, "
+                     "not evicted (%llu MB of such textures; RX_VK_KEEP_RESAMPLED_MB=0: evicted)", tex->id, (unsigned long long)tex->gpu,
+                     tex->width, tex->height, tex->nvn_format, (unsigned long long)(tex->bytes >> 20),
+                     (unsigned long long)(resampled_total >> 20));
+            continue;
+        }
         // (hookshot, RX_VK_COMPACT: the hold's pass, above. A live texture stays once the excess over its line is covered: the
         // reserve's line for one long unused, the hold's own for one unused ten seconds, and what the other rules ask (the 90%
         // rule, the budget's size, the driver's limit) for one unused as long as an eviction asks with the compaction off)
@@ -4687,7 +4722,12 @@ void texture_frame(uint64_t completed) {
             const uint64_t to = vram_compact::hold_target(frame_no - last, need_unused, rule_to, hold_to, evict_to);
             if (to == UINT64_MAX || vram_compact::hold_met(total_bytes, hold_live, hold_dead, to)) continue;
         }
-        if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
+        // (one keep_resampled let go past its cap: keep_finalized's as before that rule, if it is one of its textures. It joins
+        // keep_finalized's total here, so the older ones walked before it were judged without it: they keep a little more)
+        const bool finalized_after_resampled = keep_resampled_max && resampled_candidate && finalized_once(tex);
+        if (finalized_after_resampled) finalized_kept += tex->bytes;
+        // (above. Oldest first: beyond the cap the least recently used go)
+        if (finalized_kept && (finalized_after_resampled || keep_finalized(tex))) {
             if (finalized_kept <= keep_finalized_max) continue;
             finalized_kept -= tex->bytes;
             static int logged;
